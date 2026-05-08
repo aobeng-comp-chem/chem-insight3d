@@ -169,7 +169,7 @@ def _extract_basis_set(lines):
                                 prim_exponents, contr_coeffs, shell_coords]):
         raise ValueError("fchk file is missing one or more required basis sections.")
 
-    shell_coords = shell_coords.reshape(-1, 3) * bohr_to_ang   # bohr → Å
+    shell_coords = shell_coords.reshape(-1, 3) * bohr_to_ang   
 
     # P(S=P) coefficients (only present when SP shells exist)
     psp_coeffs = _parse_array(lines, "P(S=P) Contraction coefficients", float)
@@ -312,7 +312,7 @@ def _normalise_basis(raw_basis):
 
     
     
-    return basis
+    return raw_basis#basis
 
 
 # ---------------------------------------------------------------------------
@@ -518,3 +518,68 @@ def compute_cube_data_fchk(fchk_path, orbital_indices, spin,
             "bohr_const": bohr_const,
         })
     return results
+
+
+if __name__ == '__main__':
+    import sys
+
+    path = sys.argv[1] if len(sys.argv) > 1 else input("FCHK file path: ")
+    print(f"\n{'='*70}")
+    print(f"Testing FCHK orthonormality: {path}")
+    print('='*70)
+
+    final_basis, coordinates_ang, atom_info = load_basis_from_fchk(path)
+    nbas = len(final_basis)
+    print(f"  Loaded {nbas} normalized basis functions")
+    print(f"  Loaded {len(atom_info)} atoms")
+
+    orbital_indices = list(range(1, nbas + 1))
+    cmos = load_cmos_from_fchk(path, orbital_indices, spin='alpha')
+    print(f"  Loaded {len(cmos)} alpha CMOs")
+
+    from overlap_matrix import get_overlap_matrix as getSmat
+    from bas_dict import dict_keys
+
+    overlap = getSmat(final_basis, dict_keys, normalize_primitives=False, diagonal_only=False)
+    print(f"  Overlap matrix shape: {overlap.shape}")
+    print(f"  Overlap diagonal (first 10): {np.diag(overlap)[:min(10, nbas)]}")
+    
+    ortho_flat = _parse_array(open(path, 'r').read().splitlines(), "Orthonormal basis", float)
+    if ortho_flat is not None:
+        if ortho_flat.size != nbas * nbas:
+            raise ValueError(
+                f"Orthonormal basis section size mismatch: expected {nbas*nbas}, got {ortho_flat.size}"
+            )
+        ortho_basis = ortho_flat.reshape(nbas, nbas)
+        print(f"  Orthonormal basis shape: {ortho_basis.shape}")
+        ortho_product = ortho_basis.T @ ortho_basis
+        overlap_ortho = np.linalg.inv(ortho_product)
+        print(f"  inv(ortho_basis.T @ ortho_basis) computed successfully")
+        print(f"  Orthonormal product max deviation from identity: {np.max(np.abs(ortho_product - np.eye(nbas))):.8e}")
+        print(f"  Orthonormal overlap diagonal (first 10): {np.diag(overlap_ortho)[:min(10, nbas)]}")
+        diff = overlap_ortho - overlap
+        print(f"  Overlap comparison max abs diff: {np.max(np.abs(diff)):.8e}")
+        print(f"  Overlap comparison Frobenius norm diff: {np.linalg.norm(diff):.8e}")
+    else:
+        ortho_basis = None
+        overlap_ortho = None
+        print("  Orthonormal basis section not found in FCHK file")
+
+    cmat = np.column_stack(cmos)
+
+    print(overlap_ortho )
+    print("\nn0=000000000000000000000000000000000000000000")
+    print( overlap)
+    if overlap_ortho is not None:
+        print("  Using overlap_ortho for CMO orthonormality test")
+        use_overlap = overlap_ortho
+    else:
+        print("  Using final_basis overlap for CMO orthonormality test")
+        use_overlap = overlap
+
+    ortho_test = cmat.T @ use_overlap @ cmat
+    print(f"  CMO overlap test (should be close to identity):")
+    print(ortho_test)
+    print(np.diag(ortho_test))
+
+     

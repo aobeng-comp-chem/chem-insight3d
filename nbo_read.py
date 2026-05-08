@@ -325,6 +325,12 @@ def parse_file31(filename):
         atom_info   = list(zip(atom_info, *zip(*coordinates)))
         return basis_info_dict, coordinates, atom_info, to_bohr
 
+def load_aonao_matrix(filename):
+    # Placeholder: Load the AO to NAO transformation matrix from .31 or related file
+    # This needs to be implemented based on how AONAO is stored
+    # For now, raise NotImplementedError
+    raise NotImplementedError("Loading AONAO matrix is not implemented yet. Please provide the implementation.")
+
 def is_normalized(S_diag, tol=1e-5):
     return all(abs(sii - 1.0) < tol for sii in S_diag)
 
@@ -759,6 +765,24 @@ def load_cmos_headless(key_filepath, orbital_indices, spin='alpha'):
         raise ValueError(f"Not enough data: expected {nbas*nbas} floats, got {len(words)}")
     orbital_arr = np.array(words[:nbas * nbas]).reshape(nbas, nbas)
     return [orbital_arr[i - 1] for i in orbital_indices]
+
+
+def load_transformation_matrix(key_filepath, spin='alpha'):
+    """
+    Load the full NBO key-file coefficient matrix.
+
+    This is the same matrix used by load_cmos_headless(), returned as a
+    square array so callers can use it as a basis transformation matrix.
+    Rows are the key-file orbitals/basis functions, columns are AO basis
+    functions, matching the orientation used for orbital plotting.
+    """
+    _, nbas, _ = get_orbital_count(key_filepath)
+    rows = load_cmos_headless(
+        key_filepath,
+        list(range(1, nbas + 1)),
+        spin=spin,
+    )
+    return np.asarray(rows, dtype=float)
 
 # def process_47_file(file_path: str, nbas: int) -> tuple[bool, dict[str, np.ndarray]]:
 #     """Extract OVERLAP, DENSITY, and FOCK matrices from .47 file."""

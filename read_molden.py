@@ -155,34 +155,39 @@ def _parse_atoms(lines):
         atomic_nums.append(Z)
         coords_raw.append((x, y, z))
 
-    # Convert to Angstrom
+    # Convert to Angstrom and keep Bohr coordinates for basis functions
     if units == 'AU':
         coordinates_ang = [
             (x * _BOHR_TO_ANG, y * _BOHR_TO_ANG, z * _BOHR_TO_ANG)
             for x, y, z in coords_raw
         ]
+        coordinates_bohr = list(coords_raw)  # Keep in Bohr for overlap calculation
     else:
         coordinates_ang = list(coords_raw)
+        coordinates_bohr = [
+            (x / _BOHR_TO_ANG, y / _BOHR_TO_ANG, z / _BOHR_TO_ANG)
+            for x, y, z in coords_raw
+        ]
 
     atom_info = [
         (int(atomic_nums[i],),) + coordinates_ang[i]
         for i in range(len(atomic_nums))
     ]
-    return atom_symbols, atomic_nums, coordinates_ang, atom_info
+    return atom_symbols, atomic_nums, coordinates_ang, atom_info, units, coordinates_bohr
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # [GTO] parser
 # ────────────────────────────────────────────────────────────────────────────
 
-def _parse_gto(lines, coordinates_ang):
+def _parse_gto(lines, coordinates_bohr):
     """
     Parse [GTO] section.
 
     Returns a list of basis-function dicts using nbo_read field names:
         N, CENTER, shell_num, type, orb_val, exps, coeffs,
         xcenter, ycenter, zcenter
-    Coordinates (xcenter etc.) are in Angstrom.
+    Coordinates (xcenter etc.) are in Bohr.
     """
     gto_idx = _find_section(lines, 'GTO')
     if gto_idx is None:
@@ -253,7 +258,7 @@ def _parse_gto(lines, coordinates_ang):
         if len(parts) == 2 and parts[1] == '0':
             try:
                 current_atom_idx = int(parts[0])
-                current_coords   = coordinates_ang[current_atom_idx - 1]
+                current_coords   = coordinates_bohr[current_atom_idx - 1]
             except (ValueError, IndexError):
                 pass
             continue
@@ -499,8 +504,8 @@ def _parse_molden(molden_path):
     with open(molden_path, 'r') as f:
         lines = f.read().splitlines()
 
-    _, atomic_nums, coordinates_ang, atom_info = _parse_atoms(lines)
-    raw_basis = _parse_gto(lines, coordinates_ang)
+    _, atomic_nums, coordinates_ang, atom_info, units, coordinates_bohr = _parse_atoms(lines)
+    raw_basis = _parse_gto(lines, coordinates_bohr)
     nbas      = len(raw_basis)
 
     mo_a, en_a, oc_a, mo_b, en_b, oc_b = _parse_mo(lines, nbas)
@@ -521,6 +526,7 @@ def _parse_molden(molden_path):
         'occ_beta':         oc_b,
         'nbas':             nbas,
         'is_open_shell':    is_open,
+        'units':            units,
     }
 
 
@@ -674,6 +680,28 @@ def compute_cube_data_molden(molden_path, orbital_indices, spin,
     return results
 
 
+def canonical_label_order(label):
+    """Returns position in canonical order for each angular momentum"""
+    if label == 1: return 0
+    if label in [101,102,103]: return label - 101
+    if label == 255: return 0
+    if label == 252: return 1
+    if label == 253: return 2  
+    if label == 254: return 3
+    if label == 251: return 4
+    if label == 351: return 0
+    if label == 352: return 1
+    if label == 353: return 2
+    if label == 354: return 3
+    if label == 355: return 4
+    if label == 356: return 5
+    if label == 357: return 6
+    return 999  # unknown
+
+
+
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Quick diagnostic / test
 # ────────────────────────────────────────────────────────────────────────────
@@ -684,47 +712,57 @@ if __name__ == '__main__':
 
     path = sys.argv[1] if len(sys.argv) > 1 else input("Molden file path: ")
 
-    # print(f"\n{'='*60}")
-    # print(f"Parsing: {path}")
-    # print('='*60)
+    print(f"\n{'='*70}")
+    print(f"Testing Molden: {path}")
+    print('='*70)
 
     data = _parse_molden(path)
 
-    # print(f"\nAtoms ({len(data['atom_info'])}):")
-    # for atom in data['atom_info']:
-    #     print(f"  Z={atom[0]:3d}  x={atom[1]:10.5f}  y={atom[2]:10.5f}  z={atom[3]:10.5f}")
+    print(f"  Coordinate units: {data['units']}")
 
-    # print(f"\nBasis functions : {data['nbas']}")
-    # print(f"Open shell      : {data['is_open_shell']}")
-
-    # if data['ene_alpha'] is not None:
-    #     print(f"\nAlpha MOs: {len(data['ene_alpha'])}")
-    #     print(f"  Energy range : {data['ene_alpha'].min():.4f} → {data['ene_alpha'].max():.4f} Ha")
-    #     print(f"  Occupied     : {(data['occ_alpha'] > 0.3).sum()}")
-    #     print(f"  First 5 energies (Ha): {data['ene_alpha'][:5]}")
-
-    # if data['ene_beta'] is not None:
-    #     print(f"\nBeta MOs: {len(data['ene_beta'])}")
-    #     print(f"  Energy range : {data['ene_beta'].min():.4f} → {data['ene_beta'].max():.4f} Ha")
-    #     print(f"  Occupied     : {(data['occ_beta'] > 0.3).sum()}")
-# 
-    # print(f"\nFirst 3 basis functions:")
-    # for bf in data['raw_basis'][:3]:
-    #     print(f"  N={bf['N']:3d}  CENTER={bf['CENTER']}  "
-    #           f"type={bf['type']:<6}  "
-    #           f"n_prim={len(bf['exps'])}  "
-    #           f"exp[0]={bf['exps'][0]:.6f}")
-    # print(data['raw_basis'])
-    # print("\nRunning normalisation pipeline …")
-    print(data["mos_alpha"][0, :])
+    # Extract CMOs and compute overlap test
     try:
-        final_basis, coords, ai = load_basis_from_molden(path)
-        print(f"  final_norm_basis: {len(final_basis)} functions  ")
+        print(f"\nLoading basis and CMOs from {path}...")
+        final_basis, coords, atom_info = load_basis_from_molden(path)
+        nbas = len(final_basis)
+        print(f"  Number of basis functions: {nbas}")
+        print(f"  Number of atoms: {len(atom_info)}")
+
+        # Load all CMOs for testing orthonormality
+        orbital_indices = list(range(1, nbas + 1))
+        cmos = load_cmos_from_molden(path, orbital_indices, spin='alpha')
+        print(f"  Loaded {len(cmos)} CMOs (alpha spin, all {len(orbital_indices)} orbitals)")
+
+        # Compute overlap matrix from basis functions
+        print(f"\nComputing overlap matrix from basis functions...")
+        from overlap_matrix import get_overlap_matrix as getSmat
         
-        for info in final_basis:
-                for key, value in info.items():
-                    print(f"{key}: {value}")
-                print("---------------------------")   
-        # print(final_basis)
+        # Prepare dict_keys as required by get_overlap_matrix
+        dict_keys = {i: i for i in range(len(final_basis))}
+        from bas_dict import dict_keys
+        
+        # Compute overlap matrix
+        # overlap = getSmat(final_basis, dict_keys)
+        overlap  = getSmat(final_basis, dict_keys, normalize_primitives=False, diagonal_only=False)
+
+        print(f"  Overlap matrix shape: {overlap.shape}")
+        print(np.diag(overlap))
+    
+        #print(f"  Overlap matrix diagonal (should be ~1.0): {np.diag(overlap)[:min(5, nbas)]}")
+
+        # Test orthonormality: cmo.T @ overlap @ cmo
+        print(f"\nTesting orthonormality with C^T @ S @ C (should be identity for all orbitals)...")
+        cmat = np.column_stack(cmos)
+        orthonormality_test = cmat.T @ overlap @ cmat
+        diag_values = np.diag(orthonormality_test)
+
+
+        print(diag_values)
+        
+        
+
+        
     except Exception as e:
-        print(f"  Normalisation failed: {e}")
+        import traceback
+        print(f"  Error during overlap test: {e}")
+        print(traceback.format_exc())

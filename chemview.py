@@ -244,6 +244,28 @@ def _serialise_basis_functions(basis, atom_info):
     return rows
 
 
+def _recognize_source_type(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".cube":
+        return "cube"
+    if ext in {".47", ".31"}:
+        return "nbo"
+    if ext in {".fchk", ".fck"}:
+        return "fchk"
+    if ext == ".molden":
+        return "molden"
+    return None
+
+
+def _source_type_label(kind):
+    return {
+        "cube": "Cube",
+        "nbo": "NBO Basis",
+        "fchk": "Gaussian Checkpoint",
+        "molden": "Molden",
+    }.get(kind, "Unknown")
+
+
 def _deserialise_atom_info(rows):
     atom_info = []
     for atom in rows or []:
@@ -359,24 +381,18 @@ def _compute_basis_overlap(basis):
 
 def _format_hybrid_summary(angmom_dict):
     angmom_order = ['S', 'P', 'D', 'F', 'G', 'H']
-    s_val = angmom_dict.get('S', 0.0)
     parts = []
     for am in angmom_order:
         val = angmom_dict.get(am, 0.0)
-        if val <= 1e-4:
-            continue
-        if am == 'S':
-            parts.append(f"s({val:5.1f}%)")
-        else:
-            ratio = (val / s_val) if s_val > 1e-6 else 0.0
-            parts.append(f"{am.lower()}{ratio:3.1f}({val:5.1f}%)")
+        if val > 0.1:  # Show if > 0.1%
+            parts.append(f"{am.lower()}({val:5.1f}%)")
     return " ".join(parts)
 
 
 def _population_report_text(population):
     lines = [
-        "Hybridization/Polarization Analysis of NLMOs in NAO Basis:",
-        " NLMO / Occupancy / Percent from Parent NBO / Atomic Hybrid Contributions",
+        "Population Analysis:",
+        " NLMO / Occupancy / Energy / Atomic Hybrid Contributions",
         " " + "-" * 79,
         "",
     ]
@@ -384,10 +400,10 @@ def _population_report_text(population):
     for orb in population.get("orbitals", []):
         occ = orb.get("occupation")
         occ_str = f"{occ:.5f}" if occ is not None else "nan"
-        dom_pct = orb.get("dominant_percent", 0.0)
-        dom_label = orb.get("dominant_label", "").strip() or "??"
+        energy = orb.get("energy")
+        energy_str = f"{energy:.7f}" if energy is not None else "nan"
         lines.append(
-            f"  {int(orb.get('index', 0)):3d}. ({occ_str})  {dom_pct:7.4f}% {dom_label}"
+            f"  {int(orb.get('index', 0)):3d}. ({occ_str})  {energy_str}"
         )
 
         for contrib in orb.get("contribs", []):
@@ -419,9 +435,14 @@ def _population_report_text(population):
 
 
 def _population_analysis_data(c, s, basis, atom_info, fock=None, orb_occ=None, energies=None):
+    # Adapted from the provided population_analy algorithm.  Atom percentages
+    # come from signed Mulliken-style qas values; negative atom populations are
+    # clipped only when building the final percentage distribution.
     atom_angmom_ranges = _get_angmom_ranges(basis)
+    atom_ranges = _build_basis_atom_ranges(basis)
     atom_symbols = _atom_symbol_map(atom_info)
     nloc = c.shape[1]
+    iloc = np.array([i for i in range(nloc + 1)], dtype=int)
 
     if fock is not None:
         orb_energ = np.diag(c.T @ fock @ c)
@@ -439,66 +460,117 @@ def _population_analysis_data(c, s, basis, atom_info, fock=None, orb_occ=None, e
         occ = occ.astype(float)
 
     sc = s @ c
-    atom_total_contrib = defaultdict(float)
+
     orbitals = []
+    atom_total_contrib = defaultdict(float)
 
-    for iorb in range(nloc):
+    for ss in range(1, nloc + 1):
+        s_idx = iloc[ss]
+        nlist = 0
+        list_array = [0] * 100000
+        pop_array = [0.0] * 100000
+
         atom_contribs = {}
-        atom_total_sum = 0.0
-        for atom, angmom_dict in atom_angmom_ranges.items():
+
+        for a, atom_range in enumerate(atom_ranges, start=1):
+            qas = 0.0
+            bflo = int(atom_range["bflo"])
+            bfhi = int(atom_range["bfhi"])
+
+            for u in range(bflo, bfhi + 1):
+                qas += c[u, s_idx - 1] * sc[u, s_idx - 1]
+
+            if abs(qas) <= 0.001:
+                continue
+
             angmom_contribs = {}
-            atom_total = 0.0
-            for angmom, (lo, hi) in angmom_dict.items():
-                val = float(np.sum(c[lo:hi + 1, iorb] * sc[lo:hi + 1, iorb]))
-                angmom_contribs[angmom] = abs(val)
-                atom_total += abs(val)
-            for angmom in angmom_dict:
-                angmom_contribs[angmom] = 100.0 * angmom_contribs[angmom] / atom_total if atom_total > 0 else 0.0
-            angmom_contribs['_raw_total'] = atom_total
-            atom_contribs[atom] = angmom_contribs
-            atom_total_sum += atom_total
+            angmom_abs_total = 0.0
+            for angmom, (lo, hi) in atom_angmom_ranges.get(a, {}).items():
+                qas_ang = 0.0
+                for u in range(lo, hi + 1):
+                    qas_ang += c[u, s_idx - 1] * sc[u, s_idx - 1]
+                angmom_contribs[angmom] = abs(qas_ang)
+                angmom_abs_total += abs(qas_ang)
+            if angmom_abs_total > 0.001:
+                for angmom in angmom_contribs:
+                    angmom_contribs[angmom] = (
+                        100.0 * angmom_contribs[angmom] / angmom_abs_total
+                    )
+            angmom_contribs['total'] = qas
+            atom_contribs[a] = angmom_contribs
+            nlist += 1
+            list_array[nlist] = a
+            pop_array[nlist] = qas
 
-        for atom, angmom_contribs in atom_contribs.items():
-            raw_total = angmom_contribs.pop('_raw_total', 0.0)
-            angmom_contribs['total'] = (raw_total / atom_total_sum) * 100.0 if atom_total_sum > 0 else 0.0
+        # Sort by absolute value descending
+        for u in range(1, nlist + 1):
+            for t in range(1, u + 1):
+                if abs(pop_array[t]) < abs(pop_array[u]):
+                    tmp = pop_array[u]
+                    pop_array[u] = pop_array[t]
+                    pop_array[t] = tmp
+                    tt = list_array[u]
+                    list_array[u] = list_array[t]
+                    list_array[t] = tt
 
-        eval_occ = occ[iorb] if iorb < len(occ) else np.nan
-        eval_energy = orb_energ[iorb] if iorb < len(orb_energ) else np.nan
-        dom_atom = max(atom_contribs, key=lambda a: atom_contribs[a]['total']) if atom_contribs else None
-        dom_total = atom_contribs[dom_atom]['total'] if dom_atom is not None else 0.0
-        dom_sym = atom_symbols.get(dom_atom, f"A{dom_atom}") if dom_atom is not None else ""
+        eval_energy = orb_energ[s_idx - 1] if s_idx - 1 < len(orb_energ) else np.nan
+        eval_occ = occ[s_idx - 1] if s_idx - 1 < len(occ) else np.nan
+
+        # Create electron distribution
+        electron_dist = [(list_array[a], pop_array[a]) for a in range(1, nlist + 1)]
+        electron_dist.sort(key=lambda x: x[0])  # Sort by atom number
+
+        # Set negative values to zero (though pop_array is abs, but to be safe)
+        electron_dist_non_negative = [
+            (t[0], max(0, t[1]))
+            for t in electron_dist
+        ]
+
+        # Calculate the sum
+        total = sum(t[1] for t in electron_dist_non_negative)
+
+        # Create new list with percentages
+        new_electron_dist = [
+            (*t, (t[1] / total) * 100 if total > 0 else 0)
+            for t in electron_dist_non_negative
+        ]
 
         contribs = []
         summary_parts = []
-        for atom, angmom_dict in sorted(atom_contribs.items()):
-            pct_total = angmom_dict['total']
-            if pct_total < 0.1:
-                continue
-            sym = atom_symbols.get(atom, f"A{atom}")
-            hybrid = _format_hybrid_summary(angmom_dict)
-            contribs.append({
-                "atom": atom,
-                "symbol": sym,
-                "percent": pct_total,
-                "hybrid": hybrid,
-            })
-            if pct_total > 1.0:
-                summary_parts.append(f"{sym}{atom} {pct_total:.1f}% {hybrid}".strip())
+        for a, count, perc in new_electron_dist:
+            if perc > 0.01:
+                sym = atom_symbols.get(a, f"A{a}")
+                angmom_dict = atom_contribs[a].copy()
+                angmom_dict.pop('total', None)
+                hybrid = _format_hybrid_summary(angmom_dict)
+                contribs.append({
+                    "atom": a,
+                    "symbol": sym,
+                    "percent": perc,
+                    "hybrid": hybrid,
+                    "angmoms": angmom_dict,
+                })
+                summary_parts.append(f"{sym}{a} {perc:.1f}% {hybrid}".strip())
+
+        dom_atom = max(contribs, key=lambda x: x['percent'])['atom'] if contribs else None
+        dom_total = max(contribs, key=lambda x: x['percent'])['percent'] if contribs else 0.0
+        dom_sym = atom_symbols.get(dom_atom, f"A{dom_atom}") if dom_atom else ""
 
         orbitals.append({
-            "index": iorb + 1,
+            "index": s_idx,
             "energy": float(eval_energy) if np.isfinite(eval_energy) else None,
             "occupation": float(eval_occ) if np.isfinite(eval_occ) else None,
             "dominant_atom": dom_atom,
-            "dominant_label": f"{dom_sym} {dom_atom}" if dom_atom is not None else "",
+            "dominant_label": f"{dom_sym} {dom_atom}" if dom_atom else "",
             "dominant_percent": dom_total,
             "contribs": contribs,
             "summary": " | ".join(summary_parts),
         })
 
-        if np.isfinite(eval_occ) and atom_total_sum > 0:
-            for atom, angmom_dict in atom_contribs.items():
-                atom_total_contrib[atom] += (angmom_dict['total'] / 100.0) * eval_occ
+        # Accumulate atom totals
+        if np.isfinite(eval_occ) and total > 0:
+            for a, _, perc in new_electron_dist:
+                atom_total_contrib[a] += (perc / 100.0) * eval_occ
 
     totals = []
     for atom in sorted(atom_symbols):
@@ -590,46 +662,120 @@ def _load_overlap_for_details(details, basis_size):
         except Exception:
             pass
 
+    # Compute overlap from basis functions for all source types
     basis = _deserialise_basis_functions(details.get("basis_functions"))
     return _compute_basis_overlap(basis)
 
 
-def _compute_population_analysis_from_details(details):
+def _compute_population_analysis_from_details(details, basis="AO"):
     if not details:
         return None
 
-    basis = _deserialise_basis_functions(details.get("basis_functions"))
+    basis_functions = _deserialise_basis_functions(details.get("basis_functions"))
     atom_info = _deserialise_atom_info(details.get("atom_info"))
-    orbitals = details.get("orbitals") or []
-    if not basis or not atom_info or not orbitals:
+    provided_orbitals = details.get("orbitals") or []
+    if not basis_functions or not atom_info:
         return None
 
-    cmos = []
-    energies = []
-    occupations = []
-    for orbital in orbitals:
-        coeffs = orbital.get("coefficients")
-        if coeffs is None:
-            continue
-        cmos.append(np.asarray(coeffs, dtype=float))
-        energy = orbital.get("energy")
-        occupation = orbital.get("occupation")
-        energies.append(np.nan if energy is None else float(energy))
-        occupations.append(np.nan if occupation is None else float(occupation))
-
-    if not cmos:
+    # Load all orbitals, including unoccupied
+    nbas = len(basis_functions)
+    orbital_indices = list(range(1, nbas + 1))
+    source_type = str(details.get("source_type", "")).lower()
+    source_path = details.get("source_path")
+    spin = details.get("spin", "alpha")
+    
+    try:
+        if source_type == "nbo":
+            import nbo_read as _nr
+            cmos = _nr.load_cmos_headless(source_path, orbital_indices, spin)
+        elif source_type == "fchk":
+            import fchk_read as _fr
+            cmos = _fr.load_cmos_from_fchk(source_path, orbital_indices, spin)
+        elif source_type == "molden":
+            import read_molden as _mr
+            cmos = _mr.load_cmos_from_molden(source_path, orbital_indices, spin)
+        else:
+            return None
+    except Exception as e:
+        print(f"Failed to load CMOs: {e}")
         return None
 
-    overlap = _load_overlap_for_details(details, len(basis))
+    # Compute energies and occupations for all orbitals
+    energies = np.full(nbas, np.nan)
+    occupations = np.full(nbas, np.nan)
+    try:
+        if source_type == "nbo":
+            import nbo_read as _nr
+            ene, occ, _, _ = _nr.get_orbital_energies_and_occupations(source_path, details.get("basis_source_path"))
+        elif source_type == "fchk":
+            import fchk_read as _fr
+            ene, occ, _, _ = _fr.get_orbital_energies_and_occupations_fchk(source_path)
+        elif source_type == "molden":
+            import read_molden as _mr
+            ene, occ, _, _ = _mr.get_orbital_energies_and_occupations_molden(source_path)
+        else:
+            ene = occ = None
+        
+        if ene is not None:
+            energies = np.asarray(ene, dtype=float).copy()
+        if occ is not None:
+            occupations = np.asarray(occ, dtype=float).copy()
+    except Exception:
+        pass
+
+    # Override with provided if available
+    orb_dict = {orb.get("index"): orb for orb in provided_orbitals}
+    for idx in orbital_indices:
+        if idx in orb_dict:
+            orb = orb_dict[idx]
+            if orb.get("energy") is not None:
+                energies[idx - 1] = orb.get("energy")
+            if orb.get("occupation") is not None:
+                occupations[idx - 1] = orb.get("occupation")
+
+    overlap = _load_overlap_for_details(details, nbas)
     cmat = np.column_stack(cmos)
+    print(np.diag(cmat.T @ overlap @ cmat))
+    print(np.diag(overlap))
+
+
+    # Transform to selected NBO-key basis if requested.  AO remains the default
+    # because S and the initially loaded coefficients are in the AO basis.
+    transform_key_path = None
+    if isinstance(basis, dict):
+        transform_key_path = basis.get("key_path")
+    elif isinstance(basis, str) and basis.startswith("key:"):
+        transform_key_path = basis[4:]
+
+    if transform_key_path and str(details.get("source_type", "")).lower() == "nbo":
+        try:
+            transmat = _nr.load_transformation_matrix(
+                transform_key_path,
+                details.get("spin") or "alpha",
+            )
+            transmat = np.asarray(transmat, dtype=float).T
+            if transmat.shape != (nbas, nbas):
+                raise ValueError(
+                    f"Transformation matrix shape {transmat.shape} "
+                    f"does not match AO basis size {(nbas, nbas)}"
+                )
+            cmat = np.linalg.inv(transmat) @ cmat
+            overlap = transmat.T @ overlap @ transmat
+        except Exception as e:
+            print(f"Failed to transform to selected NBO basis: {e}")
+            # Fall back to AO
+    print("Final orbital normalization check (should be close to 1.0):")
+    print(np.diag(cmat.T @ overlap @ cmat))
+
+    print(np.diag(overlap))
     return _population_analysis_data(
         cmat,
         overlap,
-        basis,
+        basis_functions,
         atom_info,
         fock=None,
-        orb_occ=np.asarray(occupations, dtype=float),
-        energies=np.asarray(energies, dtype=float),
+        orb_occ=occupations,
+        energies=energies,
     )
 
 
@@ -637,7 +783,7 @@ class _PopulationAnalysisThread(QThread):
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
 
-    def __init__(self, details, parent=None):
+    def __init__(self, details, basis="AO", parent=None):
         super().__init__(parent)
         details = details or {}
         self.details = {
@@ -649,10 +795,11 @@ class _PopulationAnalysisThread(QThread):
             "basis_functions": list(details.get("basis_functions") or []),
             "orbitals": list(details.get("orbitals") or []),
         }
+        self.basis = basis
 
     def run(self):
         try:
-            population = _compute_population_analysis_from_details(self.details)
+            population = _compute_population_analysis_from_details(self.details, self.basis)
             self.finished.emit(population)
         except Exception:
             import traceback
@@ -1174,7 +1321,7 @@ class _OrbitalPickerDialog(QDialog):
         occ_arr = self._active_occ()
         for i, cb in enumerate(self._active_checkboxes()):
             occ = occ_arr[i] if occ_arr is not None else 0
-            cb.setChecked(occ > 0.3)
+            cb.setChecked(bool(occ > 0.3))
 
     def _apply_range(self, text: str):
         if not text.strip():
@@ -3500,6 +3647,7 @@ class MultiCubeVisualizer:
 
         # Session state
         self.session_file               = None
+        self.recent_files               = []
 
         # Open panel references (non-modal dialogs)
         self._panels                    = {}
@@ -3888,13 +4036,17 @@ class MultiCubeVisualizer:
                     lines.append(f"E = {energy:.4f} Ha")
                 if occ is not None:
                     lines.append(f"occ = {occ:.3f}")
-                if entry.get("dominant_label"):
+
+                for contrib in entry.get("contribs", []):
+                    pct_total = contrib.get("percent", 0.0)
+                    if pct_total < 0.1:
+                        continue
+                    sym = contrib.get("symbol", "??")
+                    atom = contrib.get("atom", "")
+                    hybrid = contrib.get("hybrid", "")
                     lines.append(
-                        f"Parent: {entry['dominant_label']} "
-                        f"({entry.get('dominant_percent', 0.0):.1f}%)"
+                        f"{pct_total:6.3f}%  {sym} {atom:<3d}  {hybrid}"
                     )
-                summary = entry.get("summary") or "No significant atom contributions"
-                lines.append(summary)
                 return "\n".join(lines)
         return None
 
@@ -3907,42 +4059,35 @@ class MultiCubeVisualizer:
         if self.source_details and self.source_details.get("_population_loading"):
             self.population_actor = self.plotter.add_text(
                 "Computing population analysis...",
-                position=(0.72, 0.08),
+                position=(0.94, 0.08),
                 viewport=True,
-                font_size=9,
+                font_size=10,
                 color=self._title_color(),
+                shadow=True,
             )
+            if hasattr(self.population_actor, 'GetTextProperty'):
+                self.population_actor.GetTextProperty().SetJustificationToRight()
+                self.population_actor.GetTextProperty().SetVerticalJustificationToBottom()
             return
+
         text = self._current_population_summary()
         if not text:
             return
+        import textwrap
         wrapped_lines = []
         for line in text.splitlines():
-            if len(line) <= 42:
-                wrapped_lines.append(line)
-                continue
-            parts = [p.strip() for p in line.split(",")]
-            current = ""
-            for part in parts:
-                candidate = part if not current else f"{current}, {part}"
-                if len(candidate) <= 42:
-                    current = candidate
-                else:
-                    if current:
-                        wrapped_lines.append(current)
-                    current = part
-            if current:
-                wrapped_lines.append(current)
+            wrapped_lines.extend(textwrap.wrap(line, width=40) or [line])
         self.population_actor = self.plotter.add_text(
             "\n".join(wrapped_lines),
-            position=(0.72, 0.08),
+            position=(0.94, 0.08),
             viewport=True,
-            font_size=9,
+            font_size=10,
             color=self._title_color(),
             shadow=True,
         )
-
-    # ── Master update ─────────────────────────────────────────────────────────
+        if hasattr(self.population_actor, 'GetTextProperty'):
+            self.population_actor.GetTextProperty().SetJustificationToRight()
+            self.population_actor.GetTextProperty().SetVerticalJustificationToBottom()
 
     def _clear_actors(self):
         for attr in ('pos_actor', 'neg_actor', 'pos_wire_actor',
@@ -4103,6 +4248,65 @@ class MultiCubeVisualizer:
         if self._population_thread is not None and self._population_thread.isRunning():
             return
 
+        # Determine available basis options (NBO sources only)
+        basis_options = [("AO (Atomic Orbital)", "AO")]
+        source_path = self.source_details.get("source_path")
+        source_type = str(self.source_details.get("source_type", "")).lower()
+        show_dialog = False
+        
+        if source_type == "nbo":
+            import nbo_read as _nr
+            import glob
+
+            basis_source_path = self.source_details.get("basis_source_path")
+            stem_source = basis_source_path or source_path
+            if stem_source:
+                stem = os.path.splitext(stem_source)[0]
+                dirpath = os.path.dirname(stem_source) or "."
+                base = os.path.basename(stem)
+                candidates = sorted(glob.glob(os.path.join(dirpath, base + ".*")))
+                skip_exts = {
+                    ".31", ".47", ".cube", ".log", ".out", ".txt",
+                    ".py", ".json", ".png", ".pdf", ".svg",
+                }
+                for key_file in candidates:
+                    ext = os.path.splitext(key_file)[1].lower()
+                    if ext in skip_exts:
+                        continue
+                    try:
+                        orb_type, nbas, is_open = _nr.get_orbital_count(key_file)
+                        tag = " open shell" if is_open else ""
+                        label = (
+                            f"{orb_type} ({os.path.basename(key_file)}, "
+                            f"{nbas} orbitals{tag})"
+                        )
+                    except Exception:
+                        label = f"Key basis ({os.path.basename(key_file)})"
+                    basis_options.append((
+                        label,
+                        {"kind": "nbo_key", "key_path": key_file},
+                    ))
+            show_dialog = len(basis_options) > 1  # Only show if there are alternatives
+
+        # Show basis selection dialog only if there are options
+        selected_basis = "AO"
+        if show_dialog:
+            dlg = QDialog(self.main_window)
+            dlg.setWindowTitle("Population Analysis Options")
+            layout = QVBoxLayout(dlg)
+            layout.addWidget(QLabel("Select basis for population analysis:"))
+            basis_combo = QComboBox()
+            for label, value in basis_options:
+                basis_combo.addItem(label, value)
+            layout.addWidget(basis_combo)
+            btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            btns.accepted.connect(dlg.accept)
+            btns.rejected.connect(dlg.reject)
+            layout.addWidget(btns)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            selected_basis = basis_combo.currentData()
+
         self.source_details["_population_loading"] = True
         self.refresh_metadata()
 
@@ -4119,7 +4323,7 @@ class MultiCubeVisualizer:
         self._population_progress.setWindowModality(Qt.WindowModal)
         self._population_progress.show()
 
-        self._population_thread = _PopulationAnalysisThread(self.source_details, self.main_window)
+        self._population_thread = _PopulationAnalysisThread(self.source_details, selected_basis, self.main_window)
         self._population_thread.finished.connect(self._on_population_analysis_ready)
         self._population_thread.error.connect(self._on_population_analysis_error)
         self._population_thread.start()
@@ -4850,6 +5054,256 @@ class MultiCubeVisualizer:
             else:
                 self.switch_cube(first_new_idx)
 
+    def open_source_files_dialog(self):
+        """Open supported source files and recognise their type in one table."""
+        dlg = QDialog(self.main_window)
+        dlg.setWindowTitle("Open Source Files")
+        dlg.setMinimumWidth(700)
+        layout = QVBoxLayout(dlg)
+
+        tabs = QTabWidget()
+        layout.addWidget(tabs)
+
+        # Browse tab
+        browse_tab = QWidget()
+        browse_layout = QVBoxLayout(browse_tab)
+        label = QLabel(
+            "Select one or more supported source files and confirm the recognised "
+            "type before loading. Supported files: .cube, .47/.31, .fchk/.fck, .molden.")
+        label.setWordWrap(True)
+        browse_layout.addWidget(label)
+
+        table = QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels(["File", "Recognised Type"])
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.setMinimumHeight(240)
+        table.setColumnWidth(0, 350)
+        table.setColumnWidth(1, 350)
+        browse_layout.addWidget(table)
+
+        btn_row = QHBoxLayout()
+        browse_btn = QPushButton("Browse…")
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.setEnabled(False)
+        load_btn = QPushButton("Load Selected")
+        load_btn.setEnabled(False)
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addWidget(browse_btn)
+        btn_row.addWidget(remove_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(load_btn)
+        btn_row.addWidget(cancel_btn)
+        browse_layout.addLayout(btn_row)
+
+        tabs.addTab(browse_tab, "Browse")
+
+        # Recent tab
+        recent_tab = QWidget()
+        recent_layout = QVBoxLayout(recent_tab)
+        recent_label = QLabel("Select recent files to load.")
+        recent_layout.addWidget(recent_label)
+
+        recent_list = QListWidget()
+        recent_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        recent_list.setMinimumHeight(240)
+        recent_layout.addWidget(recent_list)
+
+        recent_btn_row = QHBoxLayout()
+        load_recent_btn = QPushButton("Load Selected")
+        remove_recent_btn = QPushButton("Remove Selected")
+        clear_recent_btn = QPushButton("Clear All")
+        recent_btn_row.addWidget(load_recent_btn)
+        recent_btn_row.addWidget(remove_recent_btn)
+        recent_btn_row.addWidget(clear_recent_btn)
+        recent_layout.addLayout(recent_btn_row)
+
+        tabs.addTab(recent_tab, "Recent")
+
+        # Populate recent list
+        for path in self.recent_files:
+            item = QListWidgetItem(os.path.basename(path))
+            item.setToolTip(path)
+            recent_list.addItem(item)
+
+        def update_buttons():
+            has_rows = table.rowCount() > 0
+            remove_btn.setEnabled(has_rows and bool(table.selectedItems()))
+            load_btn.setEnabled(has_rows)
+
+        def add_paths(paths):
+            table.setRowCount(0)
+            for path in paths:
+                kind = _recognize_source_type(path)
+                label_text = _source_type_label(kind) if kind else "Unknown"
+                row = table.rowCount()
+                table.insertRow(row)
+                item_path = QTableWidgetItem(os.path.basename(path))
+                item_path.setToolTip(path)
+                item_type = QTableWidgetItem(label_text)
+                if kind is None:
+                    item_type.setForeground(QColor("#f38ba8"))
+                table.setItem(row, 0, item_path)
+                table.setItem(row, 1, item_type)
+            update_buttons()
+
+        def browse_files():
+            _qd = QFileDialog(self.main_window, "Select Source Files")
+            _qd.setOption(QFileDialog.DontUseNativeDialog)
+            _qd.setDirectory(_default_dir())
+            _qd.setFileMode(QFileDialog.ExistingFiles)
+            _qd.setNameFilter(
+                "Supported Source Files (*.cube *.47 *.31 *.fchk *.fck *.molden);;"
+                "Cube Files (*.cube);;NBO Basis Files (*.47 *.31);;"
+                "Gaussian Checkpoint Files (*.fchk *.fck);;Molden Files (*.molden);;All Files (*)"
+            )
+            paths = _qd.selectedFiles() if _qd.exec_() else []
+            if paths:
+                _remember_dir(paths[0])
+                add_paths(paths)
+
+        def remove_selected():
+            selected_rows = sorted({item.row() for item in table.selectedItems()}, reverse=True)
+            for row in selected_rows:
+                table.removeRow(row)
+            update_buttons()
+
+        def accept_load():
+            if table.rowCount() == 0:
+                return
+            bad_rows = []
+            for row in range(table.rowCount()):
+                item_path = table.item(row, 0)
+                path = item_path.toolTip() if item_path else None
+                if _recognize_source_type(path) is None:
+                    bad_rows.append(path)
+            if bad_rows:
+                QMessageBox.warning(
+                    dlg, "Unsupported Files",
+                    "The following files are not supported:\n" + "\n".join(bad_rows)
+                )
+                return
+            dlg.accept()
+
+        # Recent functions
+        def load_recent():
+            selected_items = recent_list.selectedItems()
+            if not selected_items:
+                return
+            paths = [item.toolTip() for item in selected_items]
+            dlg.accept()
+            self._load_source_files(paths)
+
+        def remove_recent():
+            selected_items = recent_list.selectedItems()
+            if not selected_items:
+                return
+            for item in selected_items:
+                path = item.toolTip()
+                if path in self.recent_files:
+                    self.recent_files.remove(path)
+                recent_list.takeItem(recent_list.row(item))
+
+        def clear_recent():
+            self.recent_files.clear()
+            recent_list.clear()
+
+        browse_btn.clicked.connect(browse_files)
+        remove_btn.clicked.connect(remove_selected)
+        load_btn.clicked.connect(accept_load)
+        cancel_btn.clicked.connect(dlg.reject)
+        table.itemSelectionChanged.connect(update_buttons)
+
+        load_recent_btn.clicked.connect(load_recent)
+        remove_recent_btn.clicked.connect(remove_recent)
+        clear_recent_btn.clicked.connect(clear_recent)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        # Only load from browse tab if accepted
+        if tabs.currentIndex() == 0 and table.rowCount() > 0:
+            paths = [table.item(r, 0).toolTip() for r in range(table.rowCount())]
+            self._load_source_files(paths)
+
+    def _load_source_files(self, paths):
+        sources = defaultdict(list)
+        unknown = []
+        for path in paths:
+            kind = _recognize_source_type(path)
+            if kind is None:
+                unknown.append(path)
+            else:
+                sources[kind].append(path)
+
+        if unknown:
+            QMessageBox.warning(
+                self.main_window, "Unsupported File Type",
+                "Cannot load these files:\n" + "\n".join(unknown)
+            )
+            return
+
+        # Load cube files first
+        if sources.get("cube"):
+            self.cube_files = []
+            self.cubes = []
+            self.current_cube_index = 0
+            self._set_source_details(None)
+            if self.cube_list is not None:
+                self.cube_list.blockSignals(True)
+                self.cube_list.clear()
+                self.cube_list.blockSignals(False)
+            first_new_idx = None
+            for fname in sources["cube"]:
+                fname = os.path.abspath(fname)
+                try:
+                    cube = self.read_cube(fname)
+                    idx = len(self.cube_files)
+                    self.cube_files.append(fname)
+                    self.cubes.append(cube)
+                    if self.cube_list is not None:
+                        self.cube_list.blockSignals(True)
+                        self.cube_list.addItem(QListWidgetItem(os.path.basename(fname)))
+                        self.cube_list.blockSignals(False)
+                    if first_new_idx is None:
+                        first_new_idx = idx
+                except Exception as e:
+                    QMessageBox.warning(self.main_window, "Load Error",
+                                        f"Could not load:\n{fname}\n\n{e}")
+            if first_new_idx is not None:
+                if self.cube_list is not None:
+                    self.cube_list.setCurrentRow(first_new_idx)
+                else:
+                    self.switch_cube(first_new_idx)
+
+        # Load a single structural source file if requested
+        special = sources.get("nbo", []) + sources.get("fchk", []) + sources.get("molden", [])
+        if len(special) > 1:
+            QMessageBox.information(
+                self.main_window, "Multiple Source Files",
+                "Please open one NBO/fchk/molden source file at a time. "
+                "You can still select multiple cube files together."
+            )
+            return
+        if special:
+            path = special[0]
+            kind = _recognize_source_type(path)
+            if kind == "nbo":
+                dlg = _KeyFilePickerDialog(path, self.main_window)
+            elif kind == "fchk":
+                dlg = _FchkOrbitalPickerDialog(path, self.main_window)
+            else:
+                dlg = _MoldenOrbitalPickerDialog(path, self.main_window)
+            dlg.cubes_ready.connect(self._load_computed_cubes)
+            dlg.exec_()
+
+        # Update recent files
+        for path in paths:
+            if path not in self.recent_files:
+                self.recent_files.insert(0, path)
+        self.recent_files = self.recent_files[:10]
+
     def open_cube_operations_dialog(self):
         """Show the cube operations dialog."""
         if len(self.cubes) < 1:
@@ -5082,14 +5536,8 @@ class MultiCubeVisualizer:
 
     def _build_files_content(self, parent):
         lay = QVBoxLayout(parent); lay.setContentsMargins(8,6,8,8)
-        open_btn  = QPushButton("📂  Open Cube Files…")
-        open_btn.clicked.connect(self.open_cube_files_dialog)
-        nbo_btn   = QPushButton("🧮  Compute from Basis File…")
-        nbo_btn.clicked.connect(self.open_basis_file_dialog)
-        fchk_btn  = QPushButton("⚗  Compute from Checkpoint (.fchk)…")
-        fchk_btn.clicked.connect(self.open_fchk_file_dialog)
-        molden_btn = QPushButton("🧪  Compute from Molden (.molden)…")
-        molden_btn.clicked.connect(self.open_molden_file_dialog)
+        open_btn  = QPushButton("📂  Open / Compute Source File…")
+        open_btn.clicked.connect(self.open_source_files_dialog)
         save_btn  = QPushButton("💾  Save Cube Files…")
         save_btn.clicked.connect(self.save_cube_files_dialog)
         ses_save  = QPushButton("🗒  Save Session…")
@@ -5098,7 +5546,7 @@ class MultiCubeVisualizer:
         ses_load.clicked.connect(self.load_session)
         quit_btn  = QPushButton("✖  Close Program")
         quit_btn.clicked.connect(self.main_window.close)
-        for b in [open_btn, nbo_btn, fchk_btn, molden_btn, save_btn,
+        for b in [open_btn, save_btn,
                   self._separator(), ses_save, ses_load,
                   self._separator(), quit_btn]:
             if isinstance(b, QFrame): lay.addWidget(b)
