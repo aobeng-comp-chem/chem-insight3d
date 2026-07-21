@@ -10,7 +10,7 @@ Run directly:
 Exports after main() returns:
     final_norm_basis  – list of normalised basis function dicts
     coordinates       – list of (x, y, z) in Angstrom
-    atom_info         – list of (atomic_number, x, y, z)
+    atom_info          list of (atomic_number, x, y, z)
     bohr              – Angstrom-per-bohr constant
     orbital_dict      – {filename: [cmo_vector, ...]}
     orbital_index     – list of requested orbital indices (1-based)
@@ -334,8 +334,27 @@ def load_aonao_matrix(filename):
 def is_normalized(S_diag, tol=1e-5):
     return all(abs(sii - 1.0) < tol for sii in S_diag)
 
+# def convert_to_molden(full_basis):
+#     new_basis = copy.deepcopy(full_basis)
+#     for basis_func in new_basis:
+#         ityp = basis_func['orb_val']
+#         nc, cc, l_m_n = get_term_info(ityp)
+#         x, y, z = l_m_n[0]
+#         for iprim in range(len(basis_func['exps'])):
+#             alpha = basis_func['exps'][iprim]
+#             norm  = gaussian_norm(alpha, x, y, z)
+#             basis_func['coeffs'][iprim] *= norm
+#     return new_basis
+
+
 def convert_to_molden(full_basis):
-    new_basis = copy.deepcopy(full_basis)
+    new_basis = []
+
+    for bf in full_basis:
+        new_bf = {k: (list(v) if k == 'coeffs' or k == 'exps' else v) 
+                  for k, v in bf.items()}
+        new_basis.append(new_bf)
+        
     for basis_func in new_basis:
         ityp = basis_func['orb_val']
         nc, cc, l_m_n = get_term_info(ityp)
@@ -468,7 +487,7 @@ def iterative_basis_modification(initial_primit_info_dict, nbo_overlap_mat, max_
     return primit_info_dict, Smat
 
 
-
+import pandas as pd
 def main():
     filename = input("Enter the filename (.47 recommended or .31): ")
     file_ext = os.path.splitext(filename)[1]
@@ -489,6 +508,10 @@ def main():
         print("Basis set is in Gaussian convention (coefficients do NOT include normalization).")
         print("Converting all basis functions to ORCA/Molden convention...")
         basis_info_dict = convert_to_molden(basis_info_dict)
+        # for info in basis_info_dict:
+        #         for key, value in info.items():
+        #             print(f"{key}: {value}")
+        #         print("---------------------------")  
         print("Conversion to ORCA/Molden convention complete.")
         print("Normalizing coefficients by square root of self-overlap...")
         basis_info_dict = normalize_by_self_overlap(basis_info_dict)
@@ -524,6 +547,8 @@ def main():
                 for key, value in info.items():
                     print(f"{key}: {value}")
                 print("---------------------------")   
+
+        print(pd.DataFrame(Smat))
 
     print('Basis information extracted and renormalized...')
 

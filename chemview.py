@@ -5,8 +5,7 @@ import math
 import json
 from collections import defaultdict
 from itertools import combinations
-from concurrent.futures import ThreadPoolExecutor
-import vtk
+from path_utils import default_dir as _default_dir, remember_dir as _remember_dir, normalize_path_for_runtime as _normalize_path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QSlider, QCheckBox, QPushButton, QLabel,
@@ -26,41 +25,6 @@ import matplotlib.ticker as mticker
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from PIL import Image
-
-
-# ── Persistent last-used directory for file dialogs ──────────────────────────
-def _wsl_home():
-    """Detect the Windows user home under WSL, fall back to ~."""
-    import re as _re
-    up = os.environ.get('USERPROFILE', '')
-    if up:
-        m = _re.match(r'([A-Za-z]):[/\\\\]+(.*)', up)
-        if m:
-            path = ('/mnt/' + m.group(1).lower() + '/'
-                    + m.group(2).replace('\\\\', '/').replace('\\', '/'))
-            if os.path.isdir(path):
-                return path
-    if os.path.isdir('/mnt/c/Users'):
-        return '/mnt/c/Users'
-    return os.path.expanduser('~')
-
-_last_dir = _wsl_home()   # initialised once at startup
-
-def _default_dir():
-    """Return the last directory the user navigated to (or the WSL home)."""
-    return _last_dir
-
-def _remember_dir(path):
-    """
-    Call after every successful file-dialog pick to update _last_dir.
-    Accepts a file path or a directory path.
-    """
-    global _last_dir
-    if not path:
-        return
-    d = path if os.path.isdir(path) else os.path.dirname(path)
-    if d and os.path.isdir(d):
-        _last_dir = d
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────

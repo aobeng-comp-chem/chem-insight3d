@@ -50,6 +50,19 @@ def _parse_scalar(lines, name, dtype=float):
     return None
 
 
+def _unpack_triangular(flat, n):
+    """
+    Unpack a Gaussian fchk packed lower-triangular matrix (row-major,
+    n*(n+1)/2 elements — e.g. 'Total SCF Density') into a full symmetric
+    n x n array.
+    """
+    mat = np.zeros((n, n))
+    tril_idx = np.tril_indices(n)
+    mat[tril_idx] = flat
+    mat[(tril_idx[1], tril_idx[0])] = flat
+    return mat
+
+
 def _parse_array(lines, name, dtype=float):
     """
     Parse an array fchk section:
@@ -104,7 +117,7 @@ _COMP_MAP = {
 _LABEL_MAP = {
     "s":  ["s"],
     "p":  ["px", "py", "pz"],
-    "d":  ["d0", "dc1", "ds1", "dc2", "ds2"],
+    "d":  ["d0", "ds1", "dc1", "dc2", "ds2"],
     "f":  ["f0", "fc1", "fs1", "fc2", "fs2", "fc3", "fs3"],
     "g":  ["g0", "gc1", "gs1", "gc2", "gs2", "gc3", "gs3", "gc4", "gs4"],
     "h":  ["h0", "hc1", "hs1", "hc2", "hs2", "hc3", "hs3",
@@ -169,7 +182,7 @@ def _extract_basis_set(lines):
                                 prim_exponents, contr_coeffs, shell_coords]):
         raise ValueError("fchk file is missing one or more required basis sections.")
 
-    shell_coords = shell_coords.reshape(-1, 3) * bohr_to_ang   
+    shell_coords = shell_coords.reshape(-1, 3) #* bohr_to_ang 
 
     # P(S=P) coefficients (only present when SP shells exist)
     psp_coeffs = _parse_array(lines, "P(S=P) Contraction coefficients", float)
@@ -182,7 +195,7 @@ def _extract_basis_set(lines):
         shell_type = _TYPE_MAP.get(int(stype), f"type{stype}")
         n_prim     = int(num_primitives[shell_idx])
         atom_idx   = int(shell_to_atom[shell_idx])
-        coords     = shell_coords[shell_idx]                    # Å
+        coords     = shell_coords[shell_idx]                    
         exps       = prim_exponents[prim_idx:prim_idx + n_prim].tolist()
         s_coeffs   = contr_coeffs[prim_idx:prim_idx + n_prim].tolist()
 
@@ -299,20 +312,18 @@ def _normalise_basis(raw_basis):
     iterative_basis_modification step used for .47 files is NOT needed here.
     """
     import nbo_read as _nr
-    
-    basis = raw_basis
-
     from overlap_matrix import get_overlap_matrix as getSmat
     from bas_dict import dict_keys
-    
-    Smat  = getSmat(basis, dict_keys, normalize_primitives=True, diagonal_only=False)
-    basis = _nr.normalize_basis_info(basis, Smat)
-    Smat  = getSmat(basis, dict_keys, normalize_primitives=True, diagonal_only=False)
-    basis = _nr.normalize_by_self_overlap(basis)
+
+  
+    molden_basis = _nr.convert_to_molden(raw_basis)
+    basis_info_dict = _nr.normalize_by_self_overlap(molden_basis)
+    Smat = getSmat(basis_info_dict, dict_keys, normalize_primitives=False, diagonal_only=False)
+    final_basis = _nr.normalize_basis_info(basis_info_dict, Smat)
+    norm_basis = _sort_basis_by_shell_label_order(final_basis)
 
     
-    
-    return raw_basis#basis
+    return norm_basis
 
 
 # ---------------------------------------------------------------------------
@@ -335,9 +346,8 @@ def load_basis_from_fchk(fchk_path):
     raw_basis       = _extract_basis_set(lines)
     coordinates_ang, atom_info = _extract_atoms(lines)
     
-    # print(raw_basis[:])
     final_norm_basis = _normalise_basis(raw_basis)
-    print(final_norm_basis[:])
+
     return   final_norm_basis, coordinates_ang, atom_info
 
 
@@ -365,6 +375,33 @@ def get_orbital_count_fchk(fchk_path):
     return "CMO", int(nbas_val), has_beta
 
 
+def _get_density_matrices(lines, nbas):
+    """
+    Derive alpha/beta density matrices from fchk's packed density sections.
+        Total SCF Density (T) = alpha density + beta density
+        Spin SCF Density  (S) = alpha density - beta density   (open-shell only)
+            alpha density = (T + S) / 2
+            beta density  = (T - S) / 2
+    Returns (density_alpha, density_beta); both None if 'Total SCF Density'
+    is absent, and beta falls back to T/2 when 'Spin SCF Density' is absent
+    (closed-shell: alpha and beta densities are identical).
+    """
+    tot_flat = _parse_array(lines, "Total SCF Density", float)
+    if tot_flat is None:
+        return None, None
+    total_density = _unpack_triangular(tot_flat, nbas)
+
+    spin_flat = _parse_array(lines, "Spin SCF Density", float)
+    if spin_flat is not None:
+        spin_density  = _unpack_triangular(spin_flat, nbas)
+        density_alpha = (total_density + spin_density) / 2
+        density_beta  = (total_density - spin_density) / 2
+    else:
+        density_alpha = total_density 
+        density_beta  = total_density 
+    return density_alpha, density_beta
+
+
 def get_orbital_energies_and_occupations_fchk(fchk_path):
     """
     Return (ene_alpha, occ_alpha, ene_beta, occ_beta) from a .fchk file.
@@ -380,20 +417,44 @@ def get_orbital_energies_and_occupations_fchk(fchk_path):
     ene_beta  = _parse_array(lines, "Beta Orbital Energies", float)
     occ_beta  = _parse_array(lines, "Beta Orbital occupancies", float)
 
-    # If occupancies not present, try to derive from electron count
-    if occ_alpha is None and ene_alpha is not None:
-        n_elec_alpha = _parse_scalar(lines, "Number of alpha electrons", int)
-        nbas         = len(ene_alpha)
-        occ_alpha    = np.zeros(nbas)
-        if n_elec_alpha:
-            occ_alpha[:n_elec_alpha] = 1.0
+    need_alpha = occ_alpha is None and ene_alpha is not None
+    need_beta  = occ_beta is None and ene_beta is not None
 
-    if occ_beta is None and ene_beta is not None:
-        n_elec_beta = _parse_scalar(lines, "Number of beta electrons", int)
-        nbas        = len(ene_beta)
-        occ_beta    = np.zeros(nbas)
-        if n_elec_beta:
-            occ_beta[:n_elec_beta] = 1.0
+    if need_alpha or need_beta:
+        nbas = ene_alpha.size if ene_alpha is not None else ene_beta.size
+        density_alpha, density_beta = _get_density_matrices(lines, nbas)
+
+        # Occupancy sections are rarely written for plain SCF/DFT jobs, but
+        # the density matrix is: derive real occupation numbers from it
+        # (n_i = C_i^T S D S C_i) instead of assuming aufbau filling.
+        smat = None
+        if (need_alpha and density_alpha is not None) or (need_beta and density_beta is not None):
+            final_norm_basis, _, _ = load_basis_from_fchk(fchk_path)
+            from overlap_matrix import get_overlap_matrix as getSmat
+            from bas_dict import dict_keys
+            smat = getSmat(final_norm_basis, dict_keys, normalize_primitives=False, diagonal_only=False)
+
+        if need_alpha:
+            if density_alpha is not None:
+                coeff_flat = _parse_array(lines, "Alpha MO coefficients", float)
+                C = coeff_flat[:nbas * nbas].reshape(nbas, nbas).T
+                occ_alpha = calculate_occupation_numbers(C, smat, density_alpha)
+            else:
+                n_elec_alpha = _parse_scalar(lines, "Number of alpha electrons", int)
+                occ_alpha    = np.zeros(nbas)
+                if n_elec_alpha:
+                    occ_alpha[:n_elec_alpha] = 1.0
+
+        if need_beta:
+            if density_beta is not None:
+                coeff_flat = _parse_array(lines, "Beta MO coefficients", float)
+                C = coeff_flat[:nbas * nbas].reshape(nbas, nbas).T
+                occ_beta = calculate_occupation_numbers(C, smat, density_beta)
+            else:
+                n_elec_beta = _parse_scalar(lines, "Number of beta electrons", int)
+                occ_beta     = np.zeros(nbas)
+                if n_elec_beta:
+                    occ_beta[:n_elec_beta] = 1.0
 
     return (
         ene_alpha if ene_alpha is not None else np.array([]),
@@ -401,6 +462,24 @@ def get_orbital_energies_and_occupations_fchk(fchk_path):
         ene_beta,
         occ_beta,
     )
+
+
+def _sort_indices_by_energy(fchk_path, spin="alpha", ascending=True):
+    """Return 1-based MO indices sorted by energy."""
+    ene_alpha, _, ene_beta, _ = get_orbital_energies_and_occupations_fchk(fchk_path)
+    if spin.lower().startswith("b"):
+        if ene_beta is None:
+            raise ValueError("Beta orbital energies not present in this fchk")
+        energies = np.asarray(ene_beta)
+    else:
+        energies = np.asarray(ene_alpha)
+    if energies.size == 0:
+        _, nbas, _ = get_orbital_count_fchk(fchk_path)
+        return list(range(1, nbas + 1))
+    order = np.argsort(energies)
+    if not ascending:
+        order = order[::-1]
+    return [int(i) + 1 for i in order]
 
 
 def load_cmos_from_fchk(fchk_path, orbital_indices, spin="alpha"):
@@ -464,6 +543,9 @@ def compute_cube_data_fchk(fchk_path, orbital_indices, spin,
         _use_cpp = False
 
     final_norm_basis, coordinates_ang, atom_info = load_basis_from_fchk(fchk_path)
+    _, nbas, _ = get_orbital_count_fchk(fchk_path)
+    if orbital_indices == list(range(1, nbas + 1)):
+        orbital_indices = _sort_indices_by_energy(fchk_path, spin=spin, ascending=True)
     cmos = load_cmos_from_fchk(fchk_path, orbital_indices, spin)
 
     coord_bohr = np.array(coordinates_ang) / bohr_const
@@ -519,67 +601,113 @@ def compute_cube_data_fchk(fchk_path, orbital_indices, spin,
         })
     return results
 
+def _sort_basis_by_shell_label_order(basis):
+    """
+    Keep basis functions grouped by shell, with components ordered according to
+    _LABEL_MAP. SP shells naturally become s, px, py, pz.
+    """
+    label_order = {}
+    for labels in _LABEL_MAP.values():
+        for idx, label in enumerate(labels):
+            label_order[label] = idx
+    label_order["s"] = 0
 
+    ordered_basis = []
+    for shell_num in dict.fromkeys(bf["shell_num"] for bf in basis):
+        shell_basis = [bf for bf in basis if bf["shell_num"] == shell_num]
+        shell_basis.sort(
+            key=lambda bf: (
+                1 if bf["orb_val"] in ("px", "py", "pz") else 0,
+                label_order.get(bf["orb_val"], len(label_order)),
+            )
+        )
+        ordered_basis.extend(shell_basis)
+
+    for idx, bf in enumerate(ordered_basis, start=1):
+        bf["N"] = idx
+    return ordered_basis
+
+def calculate_occupation_numbers(C, S, D):
+        return np.diag(C.T @ S @ D @ S @ C)
+
+import pandas as pd
 if __name__ == '__main__':
     import sys
+    import nbo_read as _nr
+    from overlap_matrix import get_overlap_matrix as getSmat
+    from bas_dict import dict_keys
 
     path = sys.argv[1] if len(sys.argv) > 1 else input("FCHK file path: ")
     print(f"\n{'='*70}")
     print(f"Testing FCHK orthonormality: {path}")
     print('='*70)
 
-    final_basis, coordinates_ang, atom_info = load_basis_from_fchk(path)
-    nbas = len(final_basis)
-    print(f"  Loaded {nbas} normalized basis functions")
-    print(f"  Loaded {len(atom_info)} atoms")
+    with open(path, 'r') as f:
+        lines = f.read().splitlines()
 
-    orbital_indices = list(range(1, nbas + 1))
-    cmos = load_cmos_from_fchk(path, orbital_indices, spin='alpha')
-    print(f"  Loaded {len(cmos)} alpha CMOs")
+    final_norm_basis, coordinates_ang, atom_info = load_basis_from_fchk(path)
+    final_smat = getSmat(final_norm_basis, dict_keys, normalize_primitives=False, diagonal_only=False)
 
-    from overlap_matrix import get_overlap_matrix as getSmat
-    from bas_dict import dict_keys
-
-    overlap = getSmat(final_basis, dict_keys, normalize_primitives=False, diagonal_only=False)
-    print(f"  Overlap matrix shape: {overlap.shape}")
-    print(f"  Overlap diagonal (first 10): {np.diag(overlap)[:min(10, nbas)]}")
-    
-    ortho_flat = _parse_array(open(path, 'r').read().splitlines(), "Orthonormal basis", float)
+    ortho_flat = _parse_array(lines, "Orthonormal basis", float)
     if ortho_flat is not None:
-        if ortho_flat.size != nbas * nbas:
+        nbas = len(final_norm_basis)
+        if ortho_flat.size < nbas * nbas:
             raise ValueError(
-                f"Orthonormal basis section size mismatch: expected {nbas*nbas}, got {ortho_flat.size}"
+                f"Orthonormal basis section too small: expected at least {nbas * nbas}, got {ortho_flat.size}"
             )
-        ortho_basis = ortho_flat.reshape(nbas, nbas)
-        print(f"  Orthonormal basis shape: {ortho_basis.shape}")
-        ortho_product = ortho_basis.T @ ortho_basis
-        overlap_ortho = np.linalg.inv(ortho_product)
-        print(f"  inv(ortho_basis.T @ ortho_basis) computed successfully")
-        print(f"  Orthonormal product max deviation from identity: {np.max(np.abs(ortho_product - np.eye(nbas))):.8e}")
-        print(f"  Orthonormal overlap diagonal (first 10): {np.diag(overlap_ortho)[:min(10, nbas)]}")
-        diff = overlap_ortho - overlap
-        print(f"  Overlap comparison max abs diff: {np.max(np.abs(diff)):.8e}")
-        print(f"  Overlap comparison Frobenius norm diff: {np.linalg.norm(diff):.8e}")
+        ortho_basis = ortho_flat[:nbas * nbas].reshape(nbas, nbas)
+        print("\nOrthonormal basis top-left 5x5 block")
+        print(ortho_basis[:5, :5])
+        ortho_overlap = np.linalg.inv(ortho_basis.T @ ortho_basis)
     else:
-        ortho_basis = None
-        overlap_ortho = None
-        print("  Orthonormal basis section not found in FCHK file")
+        print("\nSection 'Orthonormal basis' not found.")
 
-    cmat = np.column_stack(cmos)
+    print(pd.DataFrame(ortho_overlap))
+        
 
-    print(overlap_ortho )
-    print("\nn0=000000000000000000000000000000000000000000")
-    print( overlap)
-    if overlap_ortho is not None:
-        print("  Using overlap_ortho for CMO orthonormality test")
-        use_overlap = overlap_ortho
+    alpha_coeff_flat = _parse_array(lines, "Alpha MO coefficients", float)
+    if alpha_coeff_flat is not None:
+        nbas = len(final_norm_basis)
+        alpha_coeffs = alpha_coeff_flat[:nbas * nbas].reshape(nbas, nbas)
+        print("\nAlpha MO coefficients top-left 5x5 block")
+        alpha_coeffs = alpha_coeffs.T
+        print(alpha_coeffs[:5, :5])
     else:
-        print("  Using final_basis overlap for CMO orthonormality test")
-        use_overlap = overlap
+        print("\nSection 'Alpha MO coefficients' not found.")
 
-    ortho_test = cmat.T @ use_overlap @ cmat
-    print(f"  CMO overlap test (should be close to identity):")
-    print(ortho_test)
-    print(np.diag(ortho_test))
+    beta_coeff_flat = _parse_array(lines, "Beta MO coefficients", float)
+    if beta_coeff_flat is not None:
+        nbas = len(final_norm_basis)
+        beta_coeffs = beta_coeff_flat[:nbas * nbas].reshape(nbas, nbas)
+        beta_coeffs = beta_coeffs.T
+        print("\nBeta MO coefficients top-left 5x5 block")
+        print(beta_coeffs[:5, :5])
+       
+    print(ortho_overlap - final_smat)
 
-     
+
+    
+   
+    ortho_test_1 = alpha_coeffs.T @ ortho_overlap @ alpha_coeffs
+   
+    ortho_test_2 = alpha_coeffs.T @ final_smat @ alpha_coeffs
+   
+    print(pd.DataFrame(ortho_overlap - final_smat))
+    print(np.diag(ortho_test_2).round(8))
+
+    print(np.diag(ortho_test_1).round(8))
+
+
+    density_alpha, density_beta = _get_density_matrices(lines, nbas)
+
+    if density_alpha is not None:
+        occ_alpha_test = calculate_occupation_numbers(alpha_coeffs, ortho_overlap, density_alpha)
+        print("\nAlpha occupation numbers (from density matrix)")
+        print(occ_alpha_test.round(8))
+
+    if density_beta is not None and beta_coeff_flat is not None:
+        occ_beta_test = calculate_occupation_numbers(beta_coeffs, ortho_overlap, density_beta)
+        print("\nBeta occupation numbers (from density matrix)")
+        print(occ_beta_test.round(8))
+
+
