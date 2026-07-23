@@ -972,7 +972,8 @@ def _write_cube_headless(filepath, grid_data, atom_info,
 
 def compute_cube_data(final_norm_basis, coordinates_ang, atom_info,
                       orbital_indices, key_filepath, spin,
-                      grid_quality, ext_dist, bohr_const):
+                      grid_quality, ext_dist, bohr_const,
+                      precomputed_cmos=None):
     """
     Compute orbital grids for the requested orbitals from a pre-loaded basis.
     Returns in-memory data only — no files are written here.
@@ -985,6 +986,11 @@ def compute_cube_data(final_norm_basis, coordinates_ang, atom_info,
     orbital_indices    : list of 1-based int
     key_filepath       : path to NBO key file (used only for label/CMO loading)
     spin               : 'alpha' or 'beta'
+    precomputed_cmos   : optional list of 1-D AO-coefficient arrays, one per
+                          orbital_indices entry, already in hand (e.g. from
+                          localization_io.localize_orbitals). When given,
+                          key_filepath is only used for labeling and the
+                          normal load_cmos_headless() call is skipped.
     grid_quality       : 50 / 75 / 100 / 125  (max grid points on widest axis)
     ext_dist           : float bohr extension past molecular bounds
     bohr_const         : Angstrom-per-bohr constant
@@ -1010,7 +1016,7 @@ def compute_cube_data(final_norm_basis, coordinates_ang, atom_info,
     except ImportError:
         _use_cpp = False
 
-    cmos = load_cmos_headless(key_filepath, orbital_indices, spin)
+    cmos = precomputed_cmos if precomputed_cmos is not None else load_cmos_headless(key_filepath, orbital_indices, spin)
 
     # Build uniform grid in bohr
     coord_bohr = np.array(coordinates_ang) / bohr_const

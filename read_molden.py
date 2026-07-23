@@ -606,11 +606,18 @@ def load_cmos_from_molden(molden_path, orbital_indices, spin='alpha'):
 
 
 def compute_cube_data_molden(molden_path, orbital_indices, spin,
-                              grid_quality, ext_dist, bohr_const):
+                              grid_quality, ext_dist, bohr_const,
+                              precomputed_cmos=None):
     """
     Compute orbital grids directly from a .molden file.
 
     Parameters match nbo_read.compute_cube_data() / fchk_read equivalents.
+
+    precomputed_cmos : optional list of 1-D AO-coefficient arrays, one per
+        orbital_indices entry, already in hand (e.g. from
+        localization_io.localize_orbitals). When given, the normal
+        load_cmos_from_molden() call is skipped.
+
     Returns the same list-of-dicts so _load_computed_cubes in chemview.py
     handles all three sources identically.
     """
@@ -624,7 +631,7 @@ def compute_cube_data_molden(molden_path, orbital_indices, spin,
 
     final_norm_basis, coordinates_ang, atom_info = \
         load_basis_from_molden(molden_path)
-    cmos = load_cmos_from_molden(molden_path, orbital_indices, spin)
+    cmos = precomputed_cmos if precomputed_cmos is not None else load_cmos_from_molden(molden_path, orbital_indices, spin)
 
     coord_bohr = np.array(coordinates_ang) / bohr_const
     ext_min    = coord_bohr.min(axis=0) - ext_dist

@@ -397,8 +397,8 @@ def _get_density_matrices(lines, nbas):
         density_alpha = (total_density + spin_density) / 2
         density_beta  = (total_density - spin_density) / 2
     else:
-        density_alpha = total_density 
-        density_beta  = total_density 
+        density_alpha = total_density / 2
+        density_beta  = total_density / 2
     return density_alpha, density_beta
 
 
@@ -524,12 +524,20 @@ def load_cmos_from_fchk(fchk_path, orbital_indices, spin="alpha"):
 
 
 def compute_cube_data_fchk(fchk_path, orbital_indices, spin,
-                            grid_quality, ext_dist, bohr_const):
+                            grid_quality, ext_dist, bohr_const,
+                            precomputed_cmos=None):
     """
     Compute orbital grids directly from a .fchk file.
 
     Parameters match nbo_read.compute_cube_data() exactly, except that
     fchk_path replaces (basis_path, key_filepath).
+
+    precomputed_cmos : optional list of 1-D AO-coefficient arrays, one per
+        orbital_indices entry, already in hand (e.g. from
+        localization_io.localize_orbitals). When given, the normal
+        load_cmos_from_fchk() call -- and its "all orbitals -> energy
+        order" reindexing -- is skipped, so orbital_indices stays aligned
+        with the supplied coefficients.
 
     Returns the same list-of-dicts format so _load_computed_cubes in
     chemview.py can handle both sources identically.
@@ -543,10 +551,13 @@ def compute_cube_data_fchk(fchk_path, orbital_indices, spin,
         _use_cpp = False
 
     final_norm_basis, coordinates_ang, atom_info = load_basis_from_fchk(fchk_path)
-    _, nbas, _ = get_orbital_count_fchk(fchk_path)
-    if orbital_indices == list(range(1, nbas + 1)):
-        orbital_indices = _sort_indices_by_energy(fchk_path, spin=spin, ascending=True)
-    cmos = load_cmos_from_fchk(fchk_path, orbital_indices, spin)
+    if precomputed_cmos is not None:
+        cmos = precomputed_cmos
+    else:
+        _, nbas, _ = get_orbital_count_fchk(fchk_path)
+        if orbital_indices == list(range(1, nbas + 1)):
+            orbital_indices = _sort_indices_by_energy(fchk_path, spin=spin, ascending=True)
+        cmos = load_cmos_from_fchk(fchk_path, orbital_indices, spin)
 
     coord_bohr = np.array(coordinates_ang) / bohr_const
     ext_min    = coord_bohr.min(axis=0) - ext_dist

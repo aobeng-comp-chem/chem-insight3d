@@ -840,6 +840,167 @@ class _ComputeThread(QThread):
             import traceback
             self.error.emit(traceback.format_exc())
 
+_LOCALIZE_SOURCE_LABELS = {"nbo": "NBO", "fchk": "fchk", "molden": "Molden"}
+
+
+class _LocalizeComputeThread(QThread):
+    """
+    Worker thread: runs localization_io.compute_localized_cube_data without
+    blocking the GUI. One shared thread class for all three source formats
+    -- the per-format branching (incl. the NBO ".40 key file" rule) already
+    lives inside compute_localized_cube_data, so there's no need to triple
+    this the way _ComputeThread/_FchkComputeThread/_MoldenComputeThread are.
+    """
+    finished = pyqtSignal(list)
+    error    = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, path, spin, space, n_occ, orbital_range, seed,
+                 grid_quality, ext_dist, parent=None):
+        super().__init__(parent)
+        self.path          = path
+        self.spin          = spin
+        self.space         = space
+        self.n_occ         = n_occ
+        self.orbital_range = orbital_range
+        self.seed          = seed
+        self.grid_quality  = grid_quality
+        self.ext_dist      = ext_dist
+
+    def run(self):
+        try:
+            import localization_io as _loc
+            from scipy.constants import physical_constants
+            bohr_const = physical_constants['Bohr radius'][0] * 1e10
+
+            self.progress.emit(f"Localizing {self.space} orbitals…")
+            result = _loc.compute_localized_cube_data(
+                self.path, spin=self.spin, space=self.space,
+                n_occ=self.n_occ, orbital_range=self.orbital_range,
+                seed=self.seed, grid_quality=self.grid_quality,
+                ext_dist=self.ext_dist, bohr_const=bohr_const,
+            )
+
+            source_type = _loc._recognize_source_type(self.path)
+            base = os.path.splitext(os.path.basename(self.path))[0]
+            # No '.' before LOC: _build_source_details() recovers the
+            # label base with os.path.splitext(), which would otherwise
+            # misparse ".LOC_<space>" as a file extension and desync these
+            # per-orbital labels from the cube labels compute_localized_
+            # cube_data() already assigned (breaking the population-info
+            # lookup in _current_population_summary(), which matches on
+            # label equality).
+            details = _build_source_details(
+                _LOCALIZE_SOURCE_LABELS.get(source_type, source_type),
+                f"{base}_LOC_{result['space']}", self.spin,
+                result["final_basis"], result["atom_info"],
+                result["orbital_indices"], list(result["localized_cmo"].T),
+                energies=result["energies"], occupations=result["occupations"],
+                overlap=result["overlap"], fock=result["fock"],
+                context={
+                    "basis_source_path": self.path,
+                    "localization": {
+                        "space": result["space"],
+                        "n_occ": result["n_occ"],
+                        "seed": self.seed,
+                    },
+                },
+            )
+            for r in result["cubes"]:
+                r["source_details"] = details
+
+            self.progress.emit(f"{len(result['cubes'])} localized orbital(s) ready")
+            self.finished.emit(result["cubes"])
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+
+class _LocalizeOptionsDialog(QDialog):
+    """
+    Small modal: pick which orbital subspace to Pipek-Mezey-localize.
+    Shared by the NBO/fchk/molden orbital-picker dialogs -- grid quality
+    and extension are NOT asked here, the caller reuses whatever it already
+    has configured (quality_combo/ext_slider) rather than duplicating that UI.
+    """
+
+    def __init__(self, max_orbitals, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Localize Orbitals")
+        # The shared DARK stylesheet has no QRadioButton rule (none of the
+        # picker dialogs used radio buttons before this one), so it falls
+        # back to Qt's default dark text on this dialog's dark background.
+        self.setStyleSheet(getattr(parent, "DARK", "") + """
+            QRadioButton {
+                color: #e0e0e0;
+                spacing: 8px;
+                font-size: 10pt;
+            }
+            QRadioButton::indicator {
+                width: 16px;
+                height: 16px;
+                border: 2px solid #475569;
+                border-radius: 8px;
+                background: #1e2937;
+            }
+            QRadioButton::indicator:checked {
+                background: #3b82f6;
+                border: 2px solid #60a5fa;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Pipek-Mezey localization — choose the orbital subspace:"))
+
+        self.occ_radio   = QRadioButton("Occupied orbitals")
+        self.virt_radio  = QRadioButton("Virtual (unoccupied) orbitals")
+        self.range_radio = QRadioButton("Explicit range (1-based, inclusive)")
+        self.occ_radio.setChecked(True)
+        for rb in (self.occ_radio, self.virt_radio, self.range_radio):
+            layout.addWidget(rb)
+
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("First:"))
+        self.first_spin = QSpinBox()
+        self.first_spin.setRange(1, max(1, max_orbitals))
+        self.first_spin.setValue(1)
+        range_row.addWidget(self.first_spin)
+        range_row.addWidget(QLabel("Last:"))
+        self.last_spin = QSpinBox()
+        self.last_spin.setRange(1, max(1, max_orbitals))
+        self.last_spin.setValue(max(1, max_orbitals))
+        range_row.addWidget(self.last_spin)
+        range_row.addStretch()
+        layout.addLayout(range_row)
+
+        def _sync_range_enabled():
+            enabled = self.range_radio.isChecked()
+            self.first_spin.setEnabled(enabled)
+            self.last_spin.setEnabled(enabled)
+
+        for rb in (self.occ_radio, self.virt_radio, self.range_radio):
+            rb.toggled.connect(_sync_range_enabled)
+        _sync_range_enabled()
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("Localize")
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(ok_btn)
+        layout.addLayout(btn_row)
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+
+    def selection(self):
+        """Return (space, orbital_range) ready for localize_orbitals()."""
+        if self.occ_radio.isChecked():
+            return "occupied", None
+        if self.virt_radio.isChecked():
+            return "virtual", None
+        return "range", (self.first_spin.value(), self.last_spin.value())
+
+
 class _OrbitalPickerDialog(QDialog):
     """
     Enhanced orbital selection dialog for NBO visualization.
@@ -1035,11 +1196,13 @@ class _OrbitalPickerDialog(QDialog):
         occ_btn  = QPushButton("Select Occupied Only")
         range_edit = QLineEdit(); range_edit.setPlaceholderText("1,3,5-12")
         range_btn  = QPushButton("Apply")
+        localize_btn = QPushButton("Localize Orbitals…")
         for w in (all_btn, none_btn, occ_btn):
             quick_row.addWidget(w)
         quick_row.addWidget(QLabel("Range:"))
         quick_row.addWidget(range_edit)
         quick_row.addWidget(range_btn)
+        quick_row.addWidget(localize_btn)
         quick_row.addStretch()
         orb_layout.addLayout(quick_row)
 
@@ -1158,8 +1321,36 @@ class _OrbitalPickerDialog(QDialog):
         none_btn.clicked.connect(self._select_none)
         occ_btn.clicked.connect(self._select_occupied)
         range_btn.clicked.connect(lambda: self._apply_range(range_edit.text()))
+        localize_btn.clicked.connect(self._open_localize_dialog)
         self.compute_btn.clicked.connect(self._start_compute)
         cancel_btn.clicked.connect(self.reject)
+
+    def _open_localize_dialog(self):
+        dlg = _LocalizeOptionsDialog(self.nbas, parent=self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        space, orbital_range = dlg.selection()
+
+        quality_map = {0: 50, 1: 75, 2: 100, 3: 125}
+        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        ext_dist = self.ext_slider.value() / 10.0
+        spin = "beta" if (self.spin_combo and self.spin_combo.currentIndex() == 1) else "alpha"
+
+        self.compute_btn.setEnabled(False)
+        self.status_label.setText(f"Localizing {space} orbitals…")
+
+        # self.basis_path may be a sibling .31 (_KeyFilePickerDialog accepts
+        # either as a starting point) -- localization needs the .47 file
+        # specifically (it holds $FOCK), same requirement get_fock_matrix has.
+        basis47 = os.path.splitext(self.basis_path)[0] + ".47"
+
+        self._thread = _LocalizeComputeThread(
+            basis47, spin, space, None, orbital_range, 0,
+            grid_quality, ext_dist, parent=self)
+        self._thread.progress.connect(self.status_label.setText)
+        self._thread.finished.connect(self._on_compute_done)
+        self._thread.error.connect(self._on_compute_error)
+        self._thread.start()
 
     # ── Helper: build one spin-column scroll panel ────────────────────────────
     def _build_spin_panel(self, energies, occupations, cb_list, label_list):
@@ -1622,11 +1813,13 @@ class _FchkOrbitalPickerDialog(QDialog):
         occ_btn   = QPushButton("Select Occupied Only")
         range_edit = QLineEdit(); range_edit.setPlaceholderText("1,3,5-12")
         range_btn  = QPushButton("Apply")
+        localize_btn = QPushButton("Localize Orbitals…")
         for w in (all_btn, none_btn, occ_btn):
             quick_row.addWidget(w)
         quick_row.addWidget(QLabel("Range:"))
         quick_row.addWidget(range_edit)
         quick_row.addWidget(range_btn)
+        quick_row.addWidget(localize_btn)
         quick_row.addStretch()
         orb_layout.addLayout(quick_row)
 
@@ -1729,8 +1922,31 @@ class _FchkOrbitalPickerDialog(QDialog):
         none_btn.clicked.connect(self._select_none)
         occ_btn.clicked.connect(self._select_occupied)
         range_btn.clicked.connect(lambda: self._apply_range(range_edit.text()))
+        localize_btn.clicked.connect(self._open_localize_dialog)
         self.compute_btn.clicked.connect(self._start_compute)
         cancel_btn.clicked.connect(self.reject)
+
+    def _open_localize_dialog(self):
+        dlg = _LocalizeOptionsDialog(self.nbas, parent=self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        space, orbital_range = dlg.selection()
+
+        quality_map = {0: 50, 1: 75, 2: 100, 3: 125}
+        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        ext_dist = self.ext_slider.value() / 10.0
+        spin = "beta" if (self.spin_combo and self.spin_combo.currentIndex() == 1) else "alpha"
+
+        self.compute_btn.setEnabled(False)
+        self.status_label.setText(f"Localizing {space} orbitals…")
+
+        self._thread = _LocalizeComputeThread(
+            self.fchk_path, spin, space, None, orbital_range, 0,
+            grid_quality, ext_dist, parent=self)
+        self._thread.progress.connect(self.status_label.setText)
+        self._thread.finished.connect(self._on_compute_done)
+        self._thread.error.connect(self._on_compute_error)
+        self._thread.start()
 
     # ── Reuse energy-label and selection helpers from _OrbitalPickerDialog ───
     # (defined identically here so the class is self-contained)
@@ -2027,11 +2243,13 @@ class _MoldenOrbitalPickerDialog(QDialog):
         occ_btn   = QPushButton("Select Occupied Only")
         range_edit = QLineEdit(); range_edit.setPlaceholderText("1,3,5-12")
         range_btn  = QPushButton("Apply")
+        localize_btn = QPushButton("Localize Orbitals…")
         for w in (all_btn, none_btn, occ_btn):
             quick_row.addWidget(w)
         quick_row.addWidget(QLabel("Range:"))
         quick_row.addWidget(range_edit)
         quick_row.addWidget(range_btn)
+        quick_row.addWidget(localize_btn)
         quick_row.addStretch()
         orb_layout.addLayout(quick_row)
 
@@ -2132,8 +2350,31 @@ class _MoldenOrbitalPickerDialog(QDialog):
         none_btn.clicked.connect(self._select_none)
         occ_btn.clicked.connect(self._select_occupied)
         range_btn.clicked.connect(lambda: self._apply_range(range_edit.text()))
+        localize_btn.clicked.connect(self._open_localize_dialog)
         self.compute_btn.clicked.connect(self._start_compute)
         cancel_btn.clicked.connect(self.reject)
+
+    def _open_localize_dialog(self):
+        dlg = _LocalizeOptionsDialog(self.nbas, parent=self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        space, orbital_range = dlg.selection()
+
+        quality_map = {0: 50, 1: 75, 2: 100, 3: 125}
+        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        ext_dist = self.ext_slider.value() / 10.0
+        spin = "beta" if (self.spin_combo and self.spin_combo.currentIndex() == 1) else "alpha"
+
+        self.compute_btn.setEnabled(False)
+        self.status_label.setText(f"Localizing {space} orbitals…")
+
+        self._thread = _LocalizeComputeThread(
+            self.molden_path, spin, space, None, orbital_range, 0,
+            grid_quality, ext_dist, parent=self)
+        self._thread.progress.connect(self.status_label.setText)
+        self._thread.finished.connect(self._on_compute_done)
+        self._thread.error.connect(self._on_compute_error)
+        self._thread.start()
 
     _build_spin_panel = _FchkOrbitalPickerDialog._build_spin_panel
     _make_energy_label = _FchkOrbitalPickerDialog._make_energy_label
@@ -3721,6 +3962,125 @@ class MultiCubeVisualizer:
             r_ang = 0.0
         return r_ang / b2a
 
+    # ── Camera framing (molecule-scale, independent of isosurface) ────────────
+
+    def _atom_bounds(self, padding=1.25):
+        """
+        Bounding box enclosing the current cube's atom spheres (using the same
+        per-theme display radius used for rendering). Used to frame the camera
+        on the molecule's own physical size — sphere radii, bond lengths —
+        rather than the isosurface, whose extent varies a lot between orbitals.
+        """
+        cube   = self.cubes[self.current_cube_index]
+        coords = np.asarray(cube['coordinates'])
+        radii  = np.array([self._atom_display_radius(an) for an in cube['atoms']])
+        mins   = (coords - radii[:, None]).min(axis=0)
+        maxs   = (coords + radii[:, None]).max(axis=0)
+        center = (mins + maxs) / 2
+        half   = np.maximum((maxs - mins) / 2 * padding, 0.5)
+        return (
+            center[0] - half[0], center[0] + half[0],
+            center[1] - half[1], center[1] + half[1],
+            center[2] - half[2], center[2] + half[2],
+        )
+
+    def _scene_overflow_zoom(self, margin=0.97):
+        """
+        Given the camera as currently set (orientation + distance already
+        fixed by _fit_camera_to_atoms), compute how far to additionally zoom
+        out (<=1.0) so every visible actor — atoms, bonds, isosurface lobes,
+        wireframe overlay — stays within the frame. Since orbitals can extend
+        well past the atoms themselves, fitting to atoms alone can otherwise
+        clip the isosurface at the image edges.
+
+        Projects the 8 corners of the full visible-actor bounding box through
+        the camera's world-to-viewport matrix; any corner landing outside
+        [-1, 1] means the scene overflows the frame. `margin` (<1) leaves a
+        small safety border so nothing sits exactly on the edge. Returns 1.0
+        (no change) if everything already fits.
+        """
+        renderer = self.plotter.renderer
+        bounds = renderer.ComputeVisiblePropBounds()
+        if bounds is None or not all(np.isfinite(b) for b in bounds) or bounds[1] < bounds[0]:
+            return 1.0
+        xmin, xmax, ymin, ymax, zmin, zmax = bounds
+        corners = [(x, y, z)
+                   for x in (xmin, xmax) for y in (ymin, ymax) for z in (zmin, zmax)]
+
+        cam = renderer.GetActiveCamera()
+        w, h = self.plotter.window_size
+        aspect = (w / h) if h else 1.0
+        near, far = cam.GetClippingRange()
+        proj = cam.GetCompositeProjectionTransformMatrix(aspect, near, far)
+
+        max_ndc = 0.0
+        for x, y, z in corners:
+            cx, cy, cz, cw = proj.MultiplyPoint((x, y, z, 1.0))
+            if abs(cw) < 1e-12:
+                continue
+            max_ndc = max(max_ndc, abs(cx / cw), abs(cy / cw))
+
+        if max_ndc <= margin:
+            return 1.0
+        return margin / max_ndc
+
+    def _fit_camera_to_atoms(self, zoom=1.0, dynamic=False, margin=0.97):
+        """
+        Zoom/pan the camera to frame the molecule's atoms, leaving whatever
+        orientation is currently set untouched (vtkRenderer.ResetCamera with
+        an explicit bounds argument only adjusts distance/parallel-scale
+        along the current view direction). Call this instead of a bare
+        reset_camera() so exported images stay at a fixed physical scale
+        across orbitals of the same molecule, instead of zooming in/out with
+        the isosurface's size.
+
+        `zoom` scales the fitted view afterwards (vtkCamera.Zoom: >1 zooms
+        in, <1 zooms out) without touching the viewpoint/orientation.
+        `dynamic=True` additionally computes (via _scene_overflow_zoom) how
+        far the current orbital's isosurface overflows the atom-fit frame
+        and zooms out just enough to bring it fully into view — e.g. the
+        save/export paths use this so nothing is clipped at the image edges,
+        without zooming out further than necessary for compact orbitals.
+        """
+        self.plotter.renderer.ResetCamera(self._atom_bounds())
+        if dynamic:
+            self.plotter.render()
+            zoom = min(zoom, self._scene_overflow_zoom(margin=margin))
+        if zoom != 1.0:
+            self.plotter.renderer.GetActiveCamera().Zoom(zoom)
+        self._ensure_camera_clears_scene()
+        self.plotter.renderer.ResetCameraClippingRange()
+
+    def _ensure_camera_clears_scene(self):
+        """
+        Push the camera back far enough that the full visible scene (the
+        isosurface included, which regularly extends well past the
+        atom-only bounds used for framing) can't poke through the near
+        clipping plane. Under orthographic projection the camera's distance
+        no longer affects apparent size — only ParallelScale does — so this
+        is "free": moving it back doesn't change how large anything looks,
+        it just stops a lobe pointing toward the viewer from being clipped
+        away (which otherwise makes the isosurface vanish as it rotates to
+        face the camera).
+        """
+        renderer = self.plotter.renderer
+        bounds = renderer.ComputeVisiblePropBounds()
+        if bounds is None or not all(np.isfinite(b) for b in bounds) or bounds[1] < bounds[0]:
+            return
+        xmin, xmax, ymin, ymax, zmin, zmax = bounds
+        diag = math.sqrt((xmax - xmin) ** 2 + (ymax - ymin) ** 2 + (zmax - zmin) ** 2)
+        if diag <= 0:
+            return
+        cam   = renderer.GetActiveCamera()
+        focal = np.array(cam.GetFocalPoint())
+        pos   = np.array(cam.GetPosition())
+        offset = pos - focal
+        dist   = np.linalg.norm(offset)
+        min_dist = diag * 1.5
+        if dist < min_dist:
+            direction = offset / dist if dist > 1e-9 else np.array([0.0, 0.0, 1.0])
+            cam.SetPosition(*(focal + direction * min_dist))
+
     # ── Lobe rendering ────────────────────────────────────────────────────────
 
     def _add_lobe(self, mesh, color):
@@ -4117,6 +4477,11 @@ class MultiCubeVisualizer:
         if self.show_wireframe:
             self.pos_wire_actor = self._add_wireframe_overlay(self.pos_mesh)
             self.neg_wire_actor = self._add_wireframe_overlay(self.neg_mesh)
+        # A lower isovalue can make the isosurface balloon out well past
+        # where the camera was previously positioned — push it back if
+        # needed (distance-only, doesn't change apparent size/framing).
+        self._ensure_camera_clears_scene()
+        self.plotter.renderer.ResetCameraClippingRange()
         self._update_title()
         self._update_population_overlay()
         self.refresh_metadata()
@@ -4350,14 +4715,24 @@ class MultiCubeVisualizer:
         self.current_cube_index = index
         self.update_visualization()
 
-        # Restore camera exactly — this keeps the same viewpoint regardless of
-        # where the new cube's atoms happen to sit in world space
+        # Restore camera exactly — this keeps the same viewpoint (including
+        # any manual zoom) regardless of where the new cube's atoms happen to
+        # sit in world space. Saved images always re-fit to the atoms
+        # separately at export time (see _fit_camera_to_atoms), so the live
+        # interactive view here is left entirely under the user's control.
         cam = self.plotter.renderer.GetActiveCamera()
         cam.SetPosition(saved_pos)
         cam.SetFocalPoint(saved_focal)
         cam.SetViewUp(saved_viewup)
         cam.SetDistance(saved_distance)
         cam.SetParallelScale(saved_parallel)
+        # Under orthographic projection, distance doesn't affect apparent
+        # size (only ParallelScale does) — so pushing the camera back if the
+        # new cube's isosurface is bigger than the old one is "free": it
+        # can't disturb the view the user just had, it only prevents a lobe
+        # that now pokes past where the camera used to be from getting
+        # clipped by the near plane and vanishing.
+        self._ensure_camera_clears_scene()
         self.plotter.renderer.ResetCameraClippingRange()
         self.plotter.render()
 
@@ -4634,6 +5009,17 @@ class MultiCubeVisualizer:
         if not fname.lower().endswith(f".{fmt.lower()}"):
             fname += f".{fmt.lower()}"
 
+        # Saved images should always be at the molecule's true scale, regardless
+        # of whatever zoom the user has interactively set for inspection — snap
+        # to the atom-fit framing for the capture, then restore their live view.
+        cam     = self.plotter.renderer.GetActiveCamera()
+        sv_pos  = cam.GetPosition()
+        sv_foc  = cam.GetFocalPoint()
+        sv_up   = cam.GetViewUp()
+        sv_dist = cam.GetDistance()
+        sv_par  = cam.GetParallelScale()
+        self._fit_camera_to_atoms(dynamic=True)  # <- zoom out only as far as needed to fit
+
         if self.title_actor:
             self.plotter.renderer.RemoveActor(self.title_actor)
         self.plotter.hide_axes()
@@ -4648,11 +5034,15 @@ class MultiCubeVisualizer:
             actor.VisibilityOff(); hidden_2d.append(actor)
             actor = actors_2d.GetNextActor2D()
 
-        w, h = self.plotter.window_size
         renderer.GetRenderWindow().Render()
+        # Use `scale=` (vtkWindowToImageFilter magnification) rather than
+        # `window_size=`, which actually resizes the embedded Qt render
+        # widget — since it's constrained by the surrounding layout, that
+        # resize can get clamped, leaving the molecule off-center in the
+        # captured buffer instead of centered at the higher resolution.
         raw = self.plotter.screenshot(
             return_img=True,
-            window_size=(w * scale, h * scale),
+            scale=scale,
             transparent_background=transp,
         )
         img = Image.fromarray(raw)
@@ -4660,6 +5050,9 @@ class MultiCubeVisualizer:
         for a in hidden_2d: a.VisibilityOn()
         self._update_title()
         self.plotter.show_axes()
+        cam.SetPosition(sv_pos); cam.SetFocalPoint(sv_foc); cam.SetViewUp(sv_up)
+        cam.SetDistance(sv_dist); cam.SetParallelScale(sv_par)
+        renderer.ResetCameraClippingRange()
         renderer.GetRenderWindow().Render()
 
         if fmt == "PNG":
@@ -4937,16 +5330,41 @@ class MultiCubeVisualizer:
                 QMessageBox.warning(dlg, "Error", "Folder does not exist."); return
             dlg.accept()
             orig_idx = self.current_cube_index
-            # Save camera
-            cam = self.plotter.renderer.GetActiveCamera()
-            sv_pos = cam.GetPosition(); sv_foc = cam.GetFocalPoint()
-            sv_up  = cam.GetViewUp()
+            # Save the live camera so the interactive view can be restored once
+            # export finishes.
+            cam     = self.plotter.renderer.GetActiveCamera()
+            sv_pos  = cam.GetPosition(); sv_foc = cam.GetFocalPoint()
+            sv_up   = cam.GetViewUp()
+            sv_dist = cam.GetDistance(); sv_par = cam.GetParallelScale()
+
+            # Establish the export viewpoint from the first frame's atom-fit,
+            # then reuse those exact camera params for every frame — so the
+            # whole sequence shares one fixed scale instead of each frame
+            # re-fitting (and potentially drifting) independently. Since the
+            # viewpoint is shared but orbitals overflow the atom-fit frame by
+            # different amounts, check every cube at that fixed orientation
+            # and back off to whichever needs the most zoom-out, so no frame
+            # in the sequence gets clipped.
+            self.switch_cube(0)
+            self._fit_camera_to_atoms()
+            worst_zoom = 1.0
+            for i in range(len(self.cubes)):
+                self.switch_cube(i)
+                worst_zoom = min(worst_zoom, self._scene_overflow_zoom())
+            self.switch_cube(0)
+            if worst_zoom != 1.0:
+                cam.Zoom(worst_zoom)
+                self.plotter.renderer.ResetCameraClippingRange()
+            exp_pos  = cam.GetPosition(); exp_foc = cam.GetFocalPoint()
+            exp_up   = cam.GetViewUp()
+            exp_dist = cam.GetDistance(); exp_par = cam.GetParallelScale()
+
             saved  = []
             for i in range(len(self.cubes)):
                 self.switch_cube(i)
-                # Restore camera so view is consistent
-                cam.SetPosition(sv_pos); cam.SetFocalPoint(sv_foc)
-                cam.SetViewUp(sv_up)
+                cam.SetPosition(exp_pos); cam.SetFocalPoint(exp_foc)
+                cam.SetViewUp(exp_up)
+                cam.SetDistance(exp_dist); cam.SetParallelScale(exp_par)
                 self.plotter.renderer.ResetCameraClippingRange()
                 self.plotter.render()
                 # Hide UI overlays
@@ -4959,9 +5377,9 @@ class MultiCubeVisualizer:
                 a = actors_2d.GetNextActor2D()
                 while a: a.VisibilityOff(); hidden.append(a); a = actors_2d.GetNextActor2D()
                 renderer.GetRenderWindow().Render()
-                w, h = self.plotter.window_size
+                # scale= (magnification) instead of window_size= — see save_image
                 raw  = self.plotter.screenshot(return_img=True,
-                                               window_size=(w*scale, h*scale),
+                                               scale=scale,
                                                transparent_background=transp)
                 for a in hidden: a.VisibilityOn()
                 self._update_title(); self.plotter.show_axes()
@@ -4970,6 +5388,11 @@ class MultiCubeVisualizer:
                 Image.fromarray(raw).save(out, format="PNG", dpi=(300, 300))
                 saved.append(out)
             self.switch_cube(orig_idx)
+            # Restore the live view the user had before exporting
+            cam.SetPosition(sv_pos); cam.SetFocalPoint(sv_foc); cam.SetViewUp(sv_up)
+            cam.SetDistance(sv_dist); cam.SetParallelScale(sv_par)
+            self.plotter.renderer.ResetCameraClippingRange()
+            self.plotter.render()
             QMessageBox.information(self.main_window, "Done",
                 f"Exported {len(saved)} image(s) to:\n{folder}")
         btns.accepted.connect(do_export)
@@ -6205,6 +6628,9 @@ class MultiCubeVisualizer:
             self.plotter.renderer.SetViewport(0, 0, 0.5, 1)
             r2 = self.plotter.add_renderer(viewport=(0.5, 0, 1, 1))
             self.plotter_right = r2
+            # Match the left pane's orthographic projection so zooming the
+            # right pane doesn't warp its isosurface either
+            r2.GetActiveCamera().SetParallelProjection(True)
             # Draw right pane with the selected cube
             idx = min(self.split_cube_index, len(self.cubes)-1)
             self._render_right_pane(idx)
@@ -6443,6 +6869,15 @@ QGroupBox::title {{ subcontrol-origin:margin; left:8px; color:{t['accent']}; }}
         cl.addWidget(self.plotter.interactor)
         self.main_window.setCentralWidget(central)
 
+        # Orthographic (parallel) projection: with the default perspective
+        # camera, mouse-wheel zoom dollies the camera physically closer to
+        # the isosurface, and perspective foreshortening makes the near side
+        # of a curved surface visibly bulge/warp the closer you get. Parallel
+        # projection has no such foreshortening, so zoom (which now just
+        # scales the parallel view) leaves the surface's true shape intact
+        # at any zoom level.
+        self.plotter.enable_parallel_projection()
+
         self.create_toolbar_and_side_panel()
 
         self.plotter.enable_point_picking(
@@ -6461,6 +6896,12 @@ QGroupBox::title {{ subcontrol-origin:margin; left:8px; color:{t['accent']}; }}
         self.plotter.camera_position = "yz"
         self.plotter.camera.azimuth   = 30
         self.plotter.camera.elevation = 20
+        if self.cubes:
+            # Re-fit zoom to the molecule's atoms, not the isosurface that
+            # camera_position's implicit reset just fit to — otherwise the
+            # very first orbital's isosurface size sets the scale for the
+            # whole session (or, run standalone per cube file, for the export).
+            self._fit_camera_to_atoms()
         self.main_window.show()
         sys.exit(self.app.exec_())
 
