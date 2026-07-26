@@ -113,7 +113,11 @@ def _compile(source_name: str):
 
 def main():
     built = []
-    for source_name in ("overlap_matrix.cpp", "electron_density_opt_omp.cpp"):
+    for source_name in (
+        "overlap_matrix.cpp",
+        "electron_density_opt_omp.cpp",
+        "localization_native.cpp",
+    ):
         built.append(_compile(source_name))
 
     print("\nBuild complete:")

@@ -22,6 +22,7 @@ localization once it has them.
 
 import os
 import time
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -29,6 +30,11 @@ from itertools import product
 
 from overlap_matrix import get_overlap_matrix as _get_smat
 from bas_dict import dict_keys
+
+try:
+    from localization_native import localize_orbitals_cpp as _localize_orbitals_cpp
+except Exception:  # pragma: no cover - optional native extension
+    _localize_orbitals_cpp = None
 
 
 def _recognize_source_type(path):
@@ -136,7 +142,14 @@ def get_fock_matrix(path, key_path=None, spin="alpha", cmo=None, overlap=None):
     Return the AO-basis Fock matrix F for a source file.
 
     NBO .47 files store the Fock matrix directly (the $FOCK section) and it
-    is simply read and returned as-is. fchk/molden sources don't store a
+    is simply read and returned as-is -- or, if the .47 doesn't have a
+    $FOCK section at all (some job types omit it), a zero matrix of the
+    right shape, with a RuntimeWarning. A zero Fock matrix doesn't affect
+    Pipek-Mezey localization itself (that only uses the overlap matrix),
+    but any energy/sort-order derived from it (e.g. loc_energy) becomes
+    meaningless (all zero) in that case.
+
+    fchk/molden sources don't store a
     Fock matrix, so it's rebuilt from the canonical orbital energies and MO
     coefficients:
 
@@ -174,7 +187,16 @@ def get_fock_matrix(path, key_path=None, spin="alpha", cmo=None, overlap=None):
         key = ("FOCK_BETA" if spin.lower().startswith("b") else "FOCK_ALPHA") if is_open else "FOCK"
         fock = matrix_dict.get(key)
         if fock is None or not np.any(fock):
-            raise ValueError(f"No $FOCK section found in {path}")
+            warnings.warn(
+                f"No $FOCK section found in {path} -- using a zero matrix. "
+                "Pipek-Mezey localization itself is unaffected (it only uses "
+                "the overlap matrix), but loc_energy/orbital sort order will "
+                "be meaningless (all zero) since there's no real Fock matrix "
+                "to derive them from.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return np.zeros((nbas, nbas), dtype=float)
         return fock
 
     if source_type not in ("fchk", "molden"):
@@ -303,11 +325,6 @@ def get_num_occupied_orbitals(path, key_path=None, spin="alpha"):
 def _fock_diagonal(c, fock):
     """diag(c.T @ fock @ c) without forming the full n_sel x n_sel product."""
     return np.einsum('ij,ij->j', c, fock @ c)
-
-
-import time
-
-import numpy as np
 
 
 def localize_orbitals(
@@ -836,6 +853,99 @@ def localize_orbitals(
     return sorted_c, loc_energy
 
 
+def localize_orbitals_cpp(
+    cmo,
+    overlap,
+    fock,
+    basis,
+    space="occupied",
+    n_occ=None,
+    orbital_range=None,
+    seed=0,
+):
+    """Thin wrapper around the native localization implementation.
+
+    This is intended for benchmarking the speed of a C++ implementation
+    against the pure-Python/NumPy version in :func:`localize_orbitals`.
+    """
+    if _localize_orbitals_cpp is None:
+        raise ImportError(
+            "The native localization extension is not available. Build it first "
+            "with python build_native_extensions.py"
+        )
+
+    if n_occ is None:
+        n_occ = 0
+
+    if orbital_range is None:
+        orbital_range = ()
+    else:
+        orbital_range = tuple(orbital_range)
+
+    cmo_arr = np.asarray(cmo, dtype=float)
+    n_orbitals = cmo_arr.shape[1]
+
+    if space == "occupied":
+        lo, hi = 0, n_occ
+    elif space == "virtual":
+        lo, hi = n_occ, n_orbitals
+    elif space == "range":
+        first, last = orbital_range
+        lo, hi = first - 1, last
+    else:
+        raise ValueError(f"Unknown orbital space: {space!r}; expected 'occupied', 'virtual', or 'range'.")
+
+    n_sel = hi - lo
+    rng = np.random.default_rng(seed)
+    sweep_orders = np.empty((2000, n_sel), dtype=np.intp)
+    for sweep in range(2000):
+        sweep_orders[sweep] = rng.permutation(n_sel)
+
+    return _localize_orbitals_cpp(
+        cmo_arr,
+        np.asarray(overlap, dtype=float),
+        np.asarray(fock, dtype=float),
+        basis,
+        space=space,
+        n_occ=n_occ,
+        orbital_range=orbital_range,
+        seed=seed,
+        sweep_orders=sweep_orders,
+    )
+
+
+def _localize_orbitals_with_fallback(cmo, overlap, fock, basis, space, n_occ, orbital_range, seed):
+    """
+    Prefer the native (C++) localization implementation; fall back to the
+    pure-Python localize_orbitals if it's unavailable or fails.
+
+    _localize_orbitals_cpp being non-None only means the extension
+    *imported* successfully for this Python's ABI -- it doesn't guarantee
+    a given call succeeds (native crashes/errors, unexpected input shapes,
+    etc. can still only surface when the compiled function actually runs).
+    So this is a runtime check around the call itself, not just the
+    import-time availability check localize_orbitals_cpp() already does.
+    """
+    if _localize_orbitals_cpp is not None:
+        try:
+            return localize_orbitals_cpp(
+                cmo, overlap, fock, basis,
+                space=space, n_occ=n_occ, orbital_range=orbital_range, seed=seed,
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"Native localization failed at runtime ({exc!r}); "
+                "falling back to the pure-Python implementation.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    return localize_orbitals(
+        cmo, overlap, fock, basis,
+        space=space, n_occ=n_occ, orbital_range=orbital_range, seed=seed,
+    )
+
+
 def compute_localized_cube_data(
     path,
     spin="alpha",
@@ -852,6 +962,12 @@ def compute_localized_cube_data(
     a viewer to render -- the single entry point tying together
     get_localization_inputs / get_fock_matrix / localize_orbitals and the
     per-format compute_cube_data* functions.
+
+    Localization prefers the native (C++) implementation and transparently
+    falls back to the pure-Python localize_orbitals if the extension isn't
+    built for this Python's ABI, or if the native call itself fails at
+    runtime (see _localize_orbitals_with_fallback) -- a RuntimeWarning is
+    raised when that fallback happens.
 
     NBO sources always localize the sibling `.40` key file (the canonical
     AO-basis MOs), regardless of whichever key file is used elsewhere for
@@ -922,9 +1038,9 @@ def compute_localized_cube_data(
     if space in ("occupied", "virtual") and n_occ is None:
         n_occ = get_num_occupied_orbitals(path, key_path=key_path, spin=spin)
 
-    localized_cmo, loc_energy = localize_orbitals(
+    localized_cmo, loc_energy = _localize_orbitals_with_fallback(
         cmo, overlap, fock, basis_center,
-        space=space, n_occ=n_occ, orbital_range=orbital_range, seed=seed,
+        space, n_occ, orbital_range, seed,
     )
 
     n_sel = localized_cmo.shape[1]
@@ -1003,6 +1119,14 @@ if __name__ == "__main__":
         help="Inclusive 1-based 'first-last' MO numbers, required when --space=range "
              "(e.g. '49-60').",
     )
+    parser.add_argument(
+        "--use-native", action="store_true",
+        help="Use the native C++ localization implementation instead of the pure-Python version.",
+    )
+    parser.add_argument(
+        "--compare-native", action="store_true",
+        help="Run both the Python and native implementations and print their results.",
+    )
     args = parser.parse_args()
 
     cmo, S, basis = get_localization_inputs(args.path, key_path=args.key_path, spin=args.spin)
@@ -1044,7 +1168,72 @@ if __name__ == "__main__":
         first, last = (int(x) for x in args.orbital_range.split("-"))
         orbital_range = (first, last)
 
-    localize_orbitals(
+    primary_label = "Native (C++)" if args.use_native else "Python"
+    primary_fn = localize_orbitals_cpp if args.use_native else localize_orbitals
+
+    start = time.perf_counter()
+    localized_cmo, loc_energy = primary_fn(
         cmo, S, F, basis_center,
         space=args.space, n_occ=n_occ, orbital_range=orbital_range,
-    )  # returns (sorted_c, loc_energy); loc_energy is already printed above
+    )
+    primary_elapsed = time.perf_counter() - start
+
+    print(f"\n{primary_label} implementation ({primary_elapsed:.4f}s):")
+    print(f"  localized_cmo shape : {localized_cmo.shape}")
+    print(f"  loc_energy (sorted) : {np.sort(loc_energy).round(6)}")
+
+    if args.compare_native:
+        # Both implementations use the same objective-based convergence
+        # criterion and sort their output by energy, and localize_orbitals_
+        # cpp feeds the native side the exact sweep-order sequence
+        # localize_orbitals itself would use for a given seed -- so results
+        # should agree closely for well-conditioned systems. They can still
+        # diverge when orbitals are confined to a single, genuinely
+        # degenerate atom-localized subspace: the Pipek-Mezey objective has
+        # a flat direction there, and tiny floating-point differences
+        # between the two implementations can tip which point along it
+        # either one lands on. Comparing sorted energy sets rather than
+        # assuming index alignment is still the right approach for that
+        # reason, not because of any remaining convergence-depth mismatch.
+        other_label = "Python" if args.use_native else "Native (C++)"
+        other_fn = localize_orbitals if args.use_native else localize_orbitals_cpp
+
+        start = time.perf_counter()
+        try:
+            other_cmo, other_energy = other_fn(
+                cmo, S, F, basis_center,
+                space=args.space, n_occ=n_occ, orbital_range=orbital_range,
+            )
+        except Exception as exc:
+            print(f"\n{other_label} implementation unavailable: {exc}")
+        else:
+            other_elapsed = time.perf_counter() - start
+            print(f"\n{other_label} implementation ({other_elapsed:.4f}s):")
+            print(f"  localized_cmo shape : {other_cmo.shape}")
+            print(f"  loc_energy (sorted) : {np.sort(other_energy).round(6)}")
+
+            if args.use_native:
+                py_elapsed, py_cmo, py_energy = other_elapsed, other_cmo, other_energy
+                cpp_elapsed, cpp_cmo, cpp_energy = primary_elapsed, localized_cmo, loc_energy
+            else:
+                py_elapsed, py_cmo, py_energy = primary_elapsed, localized_cmo, loc_energy
+                cpp_elapsed, cpp_cmo, cpp_energy = other_elapsed, other_cmo, other_energy
+
+            print(f"\n{'=' * 70}\nComparison\n{'=' * 70}")
+            print(f"Python runtime : {py_elapsed:.4f}s")
+            print(f"Native runtime : {cpp_elapsed:.4f}s")
+            if cpp_elapsed > 0:
+                print(f"Speedup (Python / Native) : {py_elapsed / cpp_elapsed:.2f}x")
+
+            py_sorted = np.sort(py_energy)
+            cpp_sorted = np.sort(cpp_energy)
+            if py_sorted.shape == cpp_sorted.shape:
+                print(f"Max |energy diff| (sorted sets)   : {np.max(np.abs(py_sorted - cpp_sorted)):.3e}")
+            else:
+                print("Energy arrays have different shapes -- cannot compare directly.")
+
+            py_ortho_err = np.max(np.abs(py_cmo.T @ S @ py_cmo - np.eye(py_cmo.shape[1])))
+            cpp_ortho_err = np.max(np.abs(cpp_cmo.T @ S @ cpp_cmo - np.eye(cpp_cmo.shape[1])))
+            print(f"Python orthonormality max error   : {py_ortho_err:.3e}")
+            print(f"Native orthonormality max error   : {cpp_ortho_err:.3e}")
+

@@ -89,5 +89,6 @@ ch3nh2-*
 MOLDEN_*
 SeH_*
 sto3g.fchk
-test/
+build_dist/
+test*/
 .codex
