@@ -1753,7 +1753,7 @@ class MultiCubeVisualizer:
         v        = views[preset]
         pos_dir  = np.array(v['position'], dtype=float)
         # Scale to a comfortable distance
-        extents  = cube['coordinates'].ptp(axis=0) if len(cube['coordinates']) else np.ones(3)*5
+        extents  = np.ptp(cube['coordinates'], axis=0) if len(cube['coordinates']) else np.ones(3)*5
         dist     = max(extents.max() * 2.5, 8.0)
         pos_dir  = pos_dir / (np.linalg.norm(pos_dir) + 1e-9) * dist
         cam = self.plotter.renderer.GetActiveCamera()

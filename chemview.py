@@ -1,5 +1,6 @@
 import numpy as np
 import pyvista as pv
+import vtk
 import os
 import math
 import json
@@ -3835,6 +3836,12 @@ class MultiCubeVisualizer:
         self.isovalue_edit              = None
         self.opacity_slider             = None
         self.opacity_label_value        = None
+        self.atom_scale                 = 1.0
+        self.atom_scale_slider          = None
+        self.atom_scale_label           = None
+        self.bond_scale                 = 1.0
+        self.bond_scale_slider          = None
+        self.bond_scale_label           = None
         self.selected_atoms_list_widget = None
         self.selection_label            = None
         self.measurement_label          = None
@@ -3951,7 +3958,7 @@ class MultiCubeVisualizer:
         b2a  = 0.529177 if cube['unit_bohr'] else 1.0
         e    = self.ELEMENT_DATA.get(atomic_num)
         if not e:
-            return 0.35 / b2a
+            return 0.35 / b2a * self.atom_scale
         vdw, cov, bs_r = e[1], e[2], e[3]
         mode = self.MOLECULE_THEMES[self.current_mol_theme]['mode']
         if mode == 'ball_and_stick':
@@ -3960,7 +3967,7 @@ class MultiCubeVisualizer:
             r_ang = space_filling_radius(vdw, cov)   # true VDW radius
         else:
             r_ang = 0.0
-        return r_ang / b2a
+        return r_ang / b2a * self.atom_scale
 
     # ── Camera framing (molecule-scale, independent of isosurface) ────────────
 
@@ -4131,7 +4138,7 @@ class MultiCubeVisualizer:
             if not e:
                 continue
             symbol, vdw, cov, bs_r, color = e
-            r = (vdw if mode == 'space_filling' else bs_r) / b2a
+            r = (vdw if mode == 'space_filling' else bs_r) / b2a * self.atom_scale
             sphere = pv.Sphere(radius=r, center=pos,
                                theta_resolution=RES, phi_resolution=RES)
             rgb = _hex_to_rgb255(color)
@@ -4170,7 +4177,7 @@ class MultiCubeVisualizer:
         if brad <= 0:
             return
         b2a  = 0.529177 if cube['unit_bohr'] else 1.0
-        r    = brad / b2a
+        r    = brad / b2a * self.bond_scale
         mode = theme['mode']
 
         meshes = []
@@ -4501,6 +4508,41 @@ class MultiCubeVisualizer:
         self._update_population_overlay()
         self.plotter.render()
 
+    # ── Atom / bond scale ────────────────────────────────────────────────────
+
+    def update_atom_scale(self, slider_value):
+        """
+        Rescale atom spheres in place (no isosurface/camera rebuild needed --
+        same lightweight redraw shape as set_lobe_colors). Bonds are
+        untouched, so only the atom (and highlight) actors are rebuilt.
+        """
+        scale = slider_value / 100.0
+        self.atom_scale = scale
+        if self.atom_scale_label:
+            self.atom_scale_label.setText(f"{scale:.2f}x")
+
+        for a in self.atom_actors:
+            self.plotter.remove_actor(a)
+        self.atom_actors = []
+
+        self._add_atoms()
+        self._update_selected_highlights()
+        self.plotter.render()
+
+    def update_bond_scale(self, slider_value):
+        """Rescale bond tubes in place; atoms are untouched."""
+        scale = slider_value / 100.0
+        self.bond_scale = scale
+        if self.bond_scale_label:
+            self.bond_scale_label.setText(f"{scale:.2f}x")
+
+        for a in self.bond_actors:
+            self.plotter.remove_actor(a)
+        self.bond_actors = []
+
+        self._add_bonds()
+        self.plotter.render()
+
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def set_molecule_theme(self, theme_name):
@@ -4804,7 +4846,7 @@ class MultiCubeVisualizer:
         b2a  = 0.529177 if cube['unit_bohr'] else 1.0
         for i, idx in enumerate(self.selected_atoms):
             e    = self.ELEMENT_DATA.get(cube['atoms'][idx])
-            bs_r = (e[3] if e else 0.22) / b2a
+            bs_r = (e[3] if e else 0.22) / b2a * self.atom_scale
             pos  = cube['coordinates'][idx]
             sph  = pv.Sphere(radius=bs_r * 1.45, center=pos,
                              theta_resolution=32, phi_resolution=32)
@@ -4820,13 +4862,21 @@ class MultiCubeVisualizer:
         cube = self.cubes[self.current_cube_index]
         if not self.selected_atoms:
             self.selection_label.setText("No atoms selected.")
-            return
-        lines = []
-        for i, idx in enumerate(self.selected_atoms):
-            e   = self.ELEMENT_DATA.get(cube['atoms'][idx], ('?',))
-            pos = cube['coordinates'][idx]
-            lines.append(f"[{i+1}] {e[0]}{idx+1}  ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
-        self.selection_label.setText("\n".join(lines))
+        else:
+            lines = []
+            for i, idx in enumerate(self.selected_atoms):
+                e   = self.ELEMENT_DATA.get(cube['atoms'][idx], ('?',))
+                pos = cube['coordinates'][idx]
+                lines.append(f"[{i+1}] {e[0]}{idx+1}  ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
+            self.selection_label.setText("\n".join(lines))
+
+        # The dropdown panel's height is only auto-fit to its content once,
+        # at construction time (when this label still said "No atoms
+        # selected.") -- re-fit it now so a longer, multi-atom selection
+        # isn't clipped inside the panel's original (shorter) size.
+        panel = self._dropdowns.get('measure', {}).get('panel') if hasattr(self, '_dropdowns') else None
+        if panel is not None:
+            panel.adjustSize()
 
     def compute_measurement(self):
         """Called by the Measure button."""
@@ -5261,7 +5311,7 @@ class MultiCubeVisualizer:
         v        = views[preset]
         pos_dir  = np.array(v['position'], dtype=float)
         # Scale to a comfortable distance
-        extents  = cube['coordinates'].ptp(axis=0) if len(cube['coordinates']) else np.ones(3)*5
+        extents  = np.ptp(cube['coordinates'], axis=0) if len(cube['coordinates']) else np.ones(3)*5
         dist     = max(extents.max() * 2.5, 8.0)
         pos_dir  = pos_dir / (np.linalg.norm(pos_dir) + 1e-9) * dist
         cam = self.plotter.renderer.GetActiveCamera()
@@ -5810,6 +5860,8 @@ class MultiCubeVisualizer:
             'isovalue':        self.current_isovalue,
             'opacity':         self.surface_opacity,
             'mol_theme':       self.current_mol_theme,
+            'atom_scale':      self.atom_scale,
+            'bond_scale':      self.bond_scale,
             'background':      self.background_color,
             'show_wireframe':  self.show_wireframe,
             'show_labels':     self.show_atom_labels,
@@ -5876,6 +5928,8 @@ class MultiCubeVisualizer:
         self.current_isovalue  = state.get('isovalue', 0.03)
         self.surface_opacity   = state.get('opacity', 1.0)
         self.current_mol_theme = state.get('mol_theme', 'Ball and Stick')
+        self.atom_scale        = state.get('atom_scale', 1.0)
+        self.bond_scale        = state.get('bond_scale', 1.0)
         self.background_color  = state.get('background', 'black')
         self.show_wireframe    = state.get('show_wireframe', True)
         self.show_atom_labels  = state.get('show_labels', False)
@@ -5922,7 +5976,7 @@ class MultiCubeVisualizer:
     # ── Dropdown panel content builders ──────────────────────────────────────
 
     def _build_files_content(self, parent):
-        lay = QVBoxLayout(parent); lay.setContentsMargins(8,6,8,8)
+        lay = QVBoxLayout(parent); lay.setContentsMargins(14,12,14,14); lay.setSpacing(10)
         open_btn  = QPushButton("📂  Open / Compute Source File…")
         open_btn.clicked.connect(self.open_source_files_dialog)
         save_btn  = QPushButton("💾  Save Cube Files…")
@@ -5943,7 +5997,7 @@ class MultiCubeVisualizer:
                 lay.addWidget(b)
 
     def _build_appearance_content(self, parent):
-        lay = QVBoxLayout(parent); lay.setContentsMargins(8,6,8,8)
+        lay = QVBoxLayout(parent); lay.setContentsMargins(14,12,14,14); lay.setSpacing(10)
         # Molecule theme
         lay.addWidget(QLabel("<b>Molecular Representation</b>"))
         self.mol_btn_group = QButtonGroup()
@@ -5951,6 +6005,34 @@ class MultiCubeVisualizer:
             rb = QRadioButton(tn); rb.setChecked(tn == self.current_mol_theme)
             rb.toggled.connect(lambda chk, t=tn: chk and self.set_molecule_theme(t))
             self.mol_btn_group.addButton(rb); lay.addWidget(rb)
+        lay.addWidget(self._separator())
+        lay.addWidget(QLabel("<b>Atom Size</b>"))
+        atom_scale_row = QHBoxLayout()
+        atom_scale_row.addWidget(QLabel("Small"))
+        self.atom_scale_slider = QSlider(Qt.Horizontal)
+        self.atom_scale_slider.setMinimum(25); self.atom_scale_slider.setMaximum(300)
+        self.atom_scale_slider.setValue(int(self.atom_scale * 100))
+        self.atom_scale_slider.valueChanged.connect(self.update_atom_scale)
+        atom_scale_row.addWidget(self.atom_scale_slider)
+        atom_scale_row.addWidget(QLabel("Large"))
+        lay.addLayout(atom_scale_row)
+        self.atom_scale_label = QLabel(f"{self.atom_scale:.2f}x")
+        self.atom_scale_label.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.atom_scale_label)
+
+        lay.addWidget(QLabel("<b>Bond Size</b>"))
+        bond_scale_row = QHBoxLayout()
+        bond_scale_row.addWidget(QLabel("Thin"))
+        self.bond_scale_slider = QSlider(Qt.Horizontal)
+        self.bond_scale_slider.setMinimum(25); self.bond_scale_slider.setMaximum(300)
+        self.bond_scale_slider.setValue(int(self.bond_scale * 100))
+        self.bond_scale_slider.valueChanged.connect(self.update_bond_scale)
+        bond_scale_row.addWidget(self.bond_scale_slider)
+        bond_scale_row.addWidget(QLabel("Thick"))
+        lay.addLayout(bond_scale_row)
+        self.bond_scale_label = QLabel(f"{self.bond_scale:.2f}x")
+        self.bond_scale_label.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.bond_scale_label)
         lay.addWidget(self._separator())
         lay.addWidget(QLabel("<b>Isosurface Colors</b>"))
         self.color_scheme_combo = QComboBox()
@@ -6005,7 +6087,7 @@ class MultiCubeVisualizer:
         lay.addWidget(theme_btn)
 
     def _build_camera_content(self, parent):
-        lay = QVBoxLayout(parent); lay.setContentsMargins(8,6,8,8)
+        lay = QVBoxLayout(parent); lay.setContentsMargins(14,12,14,14); lay.setSpacing(10)
         lay.addWidget(QLabel("<b>Standard Views</b>"))
         grid = QGridLayout()
         presets = ['Front','Back','Top','Bottom','Left','Right','Perspective']
@@ -6016,12 +6098,12 @@ class MultiCubeVisualizer:
         lay.addLayout(grid)
 
     def _build_measure_content(self, parent):
-        lay = QVBoxLayout(parent); lay.setContentsMargins(8,6,8,8)
+        lay = QVBoxLayout(parent); lay.setContentsMargins(14,12,14,14); lay.setSpacing(10)
         lay.addWidget(QLabel("<b>Click atoms in the viewport to select:</b>"))
         self.selection_label = QLabel("No atoms selected.")
         self.selection_label.setWordWrap(True)
         self.selection_label.setStyleSheet(
-            "background:#fff;color:#111;border:1px solid #aaa;padding:4px;min-height:48px;")
+            "background:#fff;color:#111;border:1px solid #aaa;padding:4px;min-height:96px;")
         lay.addWidget(self.selection_label)
         br = QHBoxLayout()
         mb = QPushButton("Measure"); mb.clicked.connect(self.compute_measurement)
@@ -6075,7 +6157,7 @@ class MultiCubeVisualizer:
             dlg.activateWindow()
 
     def _build_analysis_content(self, parent):
-        lay = QVBoxLayout(parent); lay.setContentsMargins(8,6,8,8)
+        lay = QVBoxLayout(parent); lay.setContentsMargins(14,12,14,14); lay.setSpacing(10)
         for lbl, tip, fn in [
             ("Difference Density Map…",  "rho(A)-rho(B)",              self.open_diff_density_dialog),
             ("Cube Operations…",         "Add/subtract/scale cubes",    self.open_cube_operations_dialog),
@@ -6088,7 +6170,7 @@ class MultiCubeVisualizer:
             btn.clicked.connect(fn); lay.addWidget(btn)
        
     def _build_export_content(self, parent):
-        lay = QVBoxLayout(parent); lay.setContentsMargins(8,6,8,8)
+        lay = QVBoxLayout(parent); lay.setContentsMargins(14,12,14,14); lay.setSpacing(10)
         lay.addWidget(QLabel("<b>Save Current View</b>"))
         fr = QHBoxLayout()
         fr.addWidget(QLabel("Format:"))
@@ -6250,12 +6332,12 @@ class MultiCubeVisualizer:
         self.main_window.addToolBar(Qt.TopToolBarArea, tb)
 
         MENUS = [
-            ("📂  Files",      "files",      self._build_files_content,      200),
-            ("🎨  Appearance", "appearance", self._build_appearance_content, 280),
-            ("📷  Camera",     "camera",     self._build_camera_content,     260),
-            ("📐  Measure",    "measure",    self._build_measure_content,    320),
-            ("🔬  Analysis",   "analysis",   self._build_analysis_content,   240),
-            ("💾  Export",     "export",     self._build_export_content,     280),
+            ("📂  Files",      "files",      self._build_files_content,      250),
+            ("🎨  Appearance", "appearance", self._build_appearance_content, 340),
+            ("📷  Camera",     "camera",     self._build_camera_content,     310),
+            ("📐  Measure",    "measure",    self._build_measure_content,    370),
+            ("🔬  Analysis",   "analysis",   self._build_analysis_content,   290),
+            ("💾  Export",     "export",     self._build_export_content,     330),
             # ("⧉  Split View", "split",      self._build_split_viewport_content, 260),
         ]
 
@@ -6880,11 +6962,19 @@ QGroupBox::title {{ subcontrol-origin:margin; left:8px; color:{t['accent']}; }}
 
         self.create_toolbar_and_side_panel()
 
-        self.plotter.enable_point_picking(
-            callback=self.atom_pick_callback,
-            left_clicking=True,
-            show_message="Left-click to select an atom.",
-            show_point=False,
+        # Atom picking is handled entirely by our own _on_left_click below
+        # (it runs its own vtkCellPicker and highlight logic) -- we don't
+        # use PyVista's enable_point_picking() callback path at all
+        # (atom_pick_callback is a no-op). enable_point_picking() still
+        # registers its own competing 'LeftButtonPressEvent' observer and,
+        # by default, clears "unpicked" actor representations and adds its
+        # own marker mesh on every click -- which stomps on the selection
+        # highlights _on_left_click just drew. So we skip it and just show
+        # the same instructional text directly.
+        self.plotter.add_text(
+            "Left-click to select an atom.",
+            font_size=18,
+            name="_point_picking_message",
         )
         self.plotter.iren.interactor.AddObserver(
             "LeftButtonPressEvent", self._on_left_click
