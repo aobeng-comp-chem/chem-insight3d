@@ -265,21 +265,20 @@ def _deserialise_basis_functions(rows):
 
 
 def _build_basis_atom_ranges(basis):
-    basis_info = []
-    current_center = None
-    start = 0
+    """
+    Group basis-function indices by their real CENTER (atom number).
+
+    Some sources (e.g. Molcas-generated NBO files) do not list all of an
+    atom's basis functions as one contiguous run -- extra shells for an
+    atom can appear later, interleaved with other atoms' shells. Grouping
+    by the actual CENTER value (rather than by contiguous-run position)
+    keeps every basis function attributed to its real atom instead of
+    fragmenting one atom into several phantom "atoms".
+    """
+    atom_indices = defaultdict(list)
     for idx, bf in enumerate(basis):
-        center = int(bf.get("CENTER", 0))
-        if current_center is None:
-            current_center = center
-            start = idx
-        elif center != current_center:
-            basis_info.append({"bflo": start, "bfhi": idx - 1})
-            current_center = center
-            start = idx
-    if basis:
-        basis_info.append({"bflo": start, "bfhi": len(basis) - 1})
-    return basis_info
+        atom_indices[int(bf.get("CENTER", 0))].append(idx)
+    return atom_indices
 
 
 def _get_angmom_ranges(basis):
@@ -305,32 +304,19 @@ def _get_angmom_ranges(basis):
             angmom = "J"
         else:
             continue
-        atom_angmom_ranges.setdefault(center, {})
-        if angmom not in atom_angmom_ranges[center]:
-            atom_angmom_ranges[center][angmom] = (index, index)
-        else:
-            atom_angmom_ranges[center][angmom] = (
-                atom_angmom_ranges[center][angmom][0], index
-            )
+        atom_angmom_ranges.setdefault(center, {}).setdefault(angmom, []).append(index)
     return atom_angmom_ranges
 
 
 def _atom_symbol_map(atom_info):
-    periodic = [
-        "", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne",
-        "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca",
-        "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
-        "Ga", "Ge", "As", "Se", "Br", "Kr", "Rb", "Sr", "Y", "Zr",
-        "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn",
-        "Sb", "Te", "I", "Xe", "Cs", "Ba", "La", "Ce", "Pr", "Nd",
-        "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb",
-        "Lu", "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
-        "Tl", "Pb", "Bi", "Po", "At", "Rn"
-    ]
+    # Reuses MultiCubeVisualizer.ELEMENT_DATA (all 118 elements) as the
+    # single source of truth for symbols, instead of keeping a second,
+    # shorter periodic-table list in sync by hand.
     mapping = {}
     for idx, atom in enumerate(atom_info or [], start=1):
         z = int(round(float(atom[0])))
-        mapping[idx] = periodic[z] if 0 <= z < len(periodic) else f"Z{z}"
+        element = MultiCubeVisualizer.ELEMENT_DATA.get(z)
+        mapping[idx] = element[0] if element else f"Z{z}"
     return mapping
 
 
@@ -429,6 +415,9 @@ def _population_analysis_data(c, s, basis, atom_info, fock=None, orb_occ=None, e
     orbitals = []
     atom_total_contrib = defaultdict(float)
 
+  
+    
+
     for ss in range(1, nloc + 1):
         s_idx = iloc[ss]
         nlist = 0
@@ -437,12 +426,9 @@ def _population_analysis_data(c, s, basis, atom_info, fock=None, orb_occ=None, e
 
         atom_contribs = {}
 
-        for a, atom_range in enumerate(atom_ranges, start=1):
+        for a in sorted(atom_ranges.keys()):
             qas = 0.0
-            bflo = int(atom_range["bflo"])
-            bfhi = int(atom_range["bfhi"])
-
-            for u in range(bflo, bfhi + 1):
+            for u in atom_ranges[a]:
                 qas += c[u, s_idx - 1] * sc[u, s_idx - 1]
 
             if abs(qas) <= 0.001:
@@ -450,9 +436,9 @@ def _population_analysis_data(c, s, basis, atom_info, fock=None, orb_occ=None, e
 
             angmom_contribs = {}
             angmom_abs_total = 0.0
-            for angmom, (lo, hi) in atom_angmom_ranges.get(a, {}).items():
+            for angmom, indices in atom_angmom_ranges.get(a, {}).items():
                 qas_ang = 0.0
-                for u in range(lo, hi + 1):
+                for u in indices:
                     qas_ang += c[u, s_idx - 1] * sc[u, s_idx - 1]
                 angmom_contribs[angmom] = abs(qas_ang)
                 angmom_abs_total += abs(qas_ang)
@@ -917,6 +903,40 @@ class _LocalizeComputeThread(QThread):
             self.error.emit(traceback.format_exc())
 
 
+class _SpinDensityComputeThread(QThread):
+    """
+    Worker thread: runs density_analysis.compute_spin_density_cube_data
+    without blocking the GUI. One shared thread class for all three source
+    formats, same rationale as _LocalizeComputeThread.
+    """
+    finished = pyqtSignal(dict)
+    error    = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, path, grid_quality, ext_dist, parent=None):
+        super().__init__(parent)
+        self.path         = path
+        self.grid_quality = grid_quality
+        self.ext_dist     = ext_dist
+
+    def run(self):
+        try:
+            import density_analysis as _da
+            from scipy.constants import physical_constants
+            bohr_const = physical_constants['Bohr radius'][0] * 1e10
+
+            self.progress.emit("Computing spin density…")
+            result = _da.compute_spin_density_cube_data(
+                self.path, grid_quality=self.grid_quality,
+                ext_dist=self.ext_dist, bohr_const=bohr_const,
+            )
+            self.progress.emit("Spin density ready")
+            self.finished.emit(result)
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+
 class _LocalizeOptionsDialog(QDialog):
     """
     Small modal: pick which orbital subspace to Pipek-Mezey-localize.
@@ -1198,12 +1218,14 @@ class _OrbitalPickerDialog(QDialog):
         range_edit = QLineEdit(); range_edit.setPlaceholderText("1,3,5-12")
         range_btn  = QPushButton("Apply")
         localize_btn = QPushButton("Localize Orbitals…")
+        spin_density_btn = QPushButton("Spin Density…")
         for w in (all_btn, none_btn, occ_btn):
             quick_row.addWidget(w)
         quick_row.addWidget(QLabel("Range:"))
         quick_row.addWidget(range_edit)
         quick_row.addWidget(range_btn)
         quick_row.addWidget(localize_btn)
+        quick_row.addWidget(spin_density_btn)
         quick_row.addStretch()
         orb_layout.addLayout(quick_row)
 
@@ -1323,6 +1345,7 @@ class _OrbitalPickerDialog(QDialog):
         occ_btn.clicked.connect(self._select_occupied)
         range_btn.clicked.connect(lambda: self._apply_range(range_edit.text()))
         localize_btn.clicked.connect(self._open_localize_dialog)
+        spin_density_btn.clicked.connect(self._open_spin_density_dialog)
         self.compute_btn.clicked.connect(self._start_compute)
         cancel_btn.clicked.connect(self.reject)
 
@@ -1352,6 +1375,41 @@ class _OrbitalPickerDialog(QDialog):
         self._thread.finished.connect(self._on_compute_done)
         self._thread.error.connect(self._on_compute_error)
         self._thread.start()
+
+    def _open_spin_density_dialog(self):
+        quality_map = {0: 50, 1: 75, 2: 100, 3: 125}
+        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        ext_dist = self.ext_slider.value() / 10.0
+
+        self.compute_btn.setEnabled(False)
+        self.status_label.setText("Computing spin density…")
+
+        # Same .47/.40 requirement as localization -- see _open_localize_dialog.
+        basis47 = os.path.splitext(self.basis_path)[0] + ".47"
+
+        self._sd_thread = _SpinDensityComputeThread(
+            basis47, grid_quality, ext_dist, parent=self)
+        self._sd_thread.progress.connect(self.status_label.setText)
+        self._sd_thread.finished.connect(self._on_spin_density_done)
+        self._sd_thread.error.connect(self._on_compute_error)
+        self._sd_thread.start()
+
+    def _on_spin_density_done(self, result):
+        self.compute_btn.setEnabled(True)
+        if not result["is_open_shell"]:
+            proceed = QMessageBox.question(
+                self, "Closed-Shell System",
+                "This is a closed-shell system, so alpha and beta densities "
+                "are identical -- the spin density is zero everywhere.\n\n"
+                "Load it anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if proceed != QMessageBox.Yes:
+                self.status_label.setText("Spin density discarded (closed-shell)")
+                return
+        self.status_label.setText("✓ Spin density ready")
+        self.cubes_ready.emit([result["cube"]])
+        self.accept()
 
     # ── Helper: build one spin-column scroll panel ────────────────────────────
     def _build_spin_panel(self, energies, occupations, cb_list, label_list):
@@ -1815,12 +1873,14 @@ class _FchkOrbitalPickerDialog(QDialog):
         range_edit = QLineEdit(); range_edit.setPlaceholderText("1,3,5-12")
         range_btn  = QPushButton("Apply")
         localize_btn = QPushButton("Localize Orbitals…")
+        spin_density_btn = QPushButton("Spin Density…")
         for w in (all_btn, none_btn, occ_btn):
             quick_row.addWidget(w)
         quick_row.addWidget(QLabel("Range:"))
         quick_row.addWidget(range_edit)
         quick_row.addWidget(range_btn)
         quick_row.addWidget(localize_btn)
+        quick_row.addWidget(spin_density_btn)
         quick_row.addStretch()
         orb_layout.addLayout(quick_row)
 
@@ -1924,6 +1984,7 @@ class _FchkOrbitalPickerDialog(QDialog):
         occ_btn.clicked.connect(self._select_occupied)
         range_btn.clicked.connect(lambda: self._apply_range(range_edit.text()))
         localize_btn.clicked.connect(self._open_localize_dialog)
+        spin_density_btn.clicked.connect(self._open_spin_density_dialog)
         self.compute_btn.clicked.connect(self._start_compute)
         cancel_btn.clicked.connect(self.reject)
 
@@ -1948,6 +2009,38 @@ class _FchkOrbitalPickerDialog(QDialog):
         self._thread.finished.connect(self._on_compute_done)
         self._thread.error.connect(self._on_compute_error)
         self._thread.start()
+
+    def _open_spin_density_dialog(self):
+        quality_map = {0: 50, 1: 75, 2: 100, 3: 125}
+        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        ext_dist = self.ext_slider.value() / 10.0
+
+        self.compute_btn.setEnabled(False)
+        self.status_label.setText("Computing spin density…")
+
+        self._sd_thread = _SpinDensityComputeThread(
+            self.fchk_path, grid_quality, ext_dist, parent=self)
+        self._sd_thread.progress.connect(self.status_label.setText)
+        self._sd_thread.finished.connect(self._on_spin_density_done)
+        self._sd_thread.error.connect(self._on_compute_error)
+        self._sd_thread.start()
+
+    def _on_spin_density_done(self, result):
+        self.compute_btn.setEnabled(True)
+        if not result["is_open_shell"]:
+            proceed = QMessageBox.question(
+                self, "Closed-Shell System",
+                "This is a closed-shell system, so alpha and beta densities "
+                "are identical -- the spin density is zero everywhere.\n\n"
+                "Load it anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if proceed != QMessageBox.Yes:
+                self.status_label.setText("Spin density discarded (closed-shell)")
+                return
+        self.status_label.setText("✓ Spin density ready")
+        self.cubes_ready.emit([result["cube"]])
+        self.accept()
 
     # ── Reuse energy-label and selection helpers from _OrbitalPickerDialog ───
     # (defined identically here so the class is self-contained)
@@ -2245,12 +2338,14 @@ class _MoldenOrbitalPickerDialog(QDialog):
         range_edit = QLineEdit(); range_edit.setPlaceholderText("1,3,5-12")
         range_btn  = QPushButton("Apply")
         localize_btn = QPushButton("Localize Orbitals…")
+        spin_density_btn = QPushButton("Spin Density…")
         for w in (all_btn, none_btn, occ_btn):
             quick_row.addWidget(w)
         quick_row.addWidget(QLabel("Range:"))
         quick_row.addWidget(range_edit)
         quick_row.addWidget(range_btn)
         quick_row.addWidget(localize_btn)
+        quick_row.addWidget(spin_density_btn)
         quick_row.addStretch()
         orb_layout.addLayout(quick_row)
 
@@ -2352,6 +2447,7 @@ class _MoldenOrbitalPickerDialog(QDialog):
         occ_btn.clicked.connect(self._select_occupied)
         range_btn.clicked.connect(lambda: self._apply_range(range_edit.text()))
         localize_btn.clicked.connect(self._open_localize_dialog)
+        spin_density_btn.clicked.connect(self._open_spin_density_dialog)
         self.compute_btn.clicked.connect(self._start_compute)
         cancel_btn.clicked.connect(self.reject)
 
@@ -2376,6 +2472,38 @@ class _MoldenOrbitalPickerDialog(QDialog):
         self._thread.finished.connect(self._on_compute_done)
         self._thread.error.connect(self._on_compute_error)
         self._thread.start()
+
+    def _open_spin_density_dialog(self):
+        quality_map = {0: 50, 1: 75, 2: 100, 3: 125}
+        grid_quality = quality_map[self.quality_combo.currentIndex()]
+        ext_dist = self.ext_slider.value() / 10.0
+
+        self.compute_btn.setEnabled(False)
+        self.status_label.setText("Computing spin density…")
+
+        self._sd_thread = _SpinDensityComputeThread(
+            self.molden_path, grid_quality, ext_dist, parent=self)
+        self._sd_thread.progress.connect(self.status_label.setText)
+        self._sd_thread.finished.connect(self._on_spin_density_done)
+        self._sd_thread.error.connect(self._on_compute_error)
+        self._sd_thread.start()
+
+    def _on_spin_density_done(self, result):
+        self.compute_btn.setEnabled(True)
+        if not result["is_open_shell"]:
+            proceed = QMessageBox.question(
+                self, "Closed-Shell System",
+                "This is a closed-shell system, so alpha and beta densities "
+                "are identical -- the spin density is zero everywhere.\n\n"
+                "Load it anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if proceed != QMessageBox.Yes:
+                self.status_label.setText("Spin density discarded (closed-shell)")
+                return
+        self.status_label.setText("✓ Spin density ready")
+        self.cubes_ready.emit([result["cube"]])
+        self.accept()
 
     _build_spin_panel = _FchkOrbitalPickerDialog._build_spin_panel
     _make_energy_label = _FchkOrbitalPickerDialog._make_energy_label

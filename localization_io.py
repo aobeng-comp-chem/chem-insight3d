@@ -116,8 +116,14 @@ def get_center_ranges(final_basis):
     """
     Group basis-function indices by their center (atom).
 
-    Assumes final_basis is ordered so all basis functions of a given
-    CENTER are contiguous (true for nbo_read/fchk_read/read_molden output).
+    Requires final_basis to already be ordered so all basis functions of a
+    given CENTER form one contiguous run -- callers should pass final_basis
+    through _reorder_for_contiguous_centers() first, since some sources
+    (e.g. Molcas-generated NBO files) list extra shells for an atom after
+    other atoms' shells instead of grouping every atom's functions
+    together. Raises rather than silently mis-partitioning, because the
+    native Pipek-Mezey extension can only represent one [bflo, bfhi] range
+    per atom.
 
     Parameters
     ----------
@@ -130,11 +136,123 @@ def get_center_ranges(final_basis):
     """
     ranges = []
     start = 0
+    seen_centers = set()
     for i in range(1, len(final_basis) + 1):
         if i == len(final_basis) or final_basis[i]["CENTER"] != final_basis[start]["CENTER"]:
+            center = final_basis[start]["CENTER"]
+            if center in seen_centers:
+                raise ValueError(
+                    f"final_basis is not center-contiguous: CENTER {center!r} "
+                    "reappears after another atom's basis functions. Call "
+                    "_reorder_for_contiguous_centers() first."
+                )
+            seen_centers.add(center)
             ranges.append({"bflo": start, "bfhi": i - 1})
             start = i
     return ranges
+
+
+def analyze_center_contiguity(final_basis):
+    """
+    Diagnose whether final_basis groups every atom's (CENTER's) basis
+    functions into one contiguous run.
+
+    This is the single source of truth for the assumption get_center_ranges()
+    requires and _reorder_for_contiguous_centers() repairs -- used
+    internally by both, and exposed publicly so external tooling (e.g.
+    check_basis_ordering.py) can report on a source file without having to
+    run localization at all.
+
+    Parameters
+    ----------
+    final_basis : list of basis-function dicts (must have a 'CENTER' key).
+
+    Returns
+    -------
+    dict with keys:
+        contiguous        : bool -- True iff every atom's basis functions
+                             form exactly one contiguous run.
+        n_atoms           : number of distinct CENTER values.
+        n_basis_functions : len(final_basis).
+        atoms             : {center: [(lo, hi), ...]} -- 0-based inclusive
+                             index ranges into final_basis for every run of
+                             that atom's basis functions, in the order they
+                             appear in the file.
+        fragmented_atoms  : sorted list of CENTER values split across more
+                             than one run.
+    """
+    atoms = {}
+    current_center = None
+    run_start = 0
+
+    def _close_run(end_idx):
+        atoms.setdefault(current_center, []).append((run_start, end_idx))
+
+    for idx, bf in enumerate(final_basis):
+        center = int(bf["CENTER"])
+        if current_center is None:
+            current_center = center
+            run_start = idx
+        elif center != current_center:
+            _close_run(idx - 1)
+            current_center = center
+            run_start = idx
+    if final_basis:
+        _close_run(len(final_basis) - 1)
+
+    fragmented_atoms = sorted(c for c, runs in atoms.items() if len(runs) > 1)
+
+    return {
+        "contiguous": not fragmented_atoms,
+        "n_atoms": len(atoms),
+        "n_basis_functions": len(final_basis),
+        "atoms": atoms,
+        "fragmented_atoms": fragmented_atoms,
+    }
+
+
+def _reorder_for_contiguous_centers(final_basis, cmo, overlap, fock):
+    """
+    Permute the AO axis so every atom's basis functions form one
+    contiguous run, ordered by CENTER.
+
+    get_center_ranges() -- and the native localization extension, which
+    stores only a single [bflo, bfhi] range per atom -- both assume this.
+    Most sources already satisfy it, in which case this is a no-op
+    (returns the inputs unchanged). Some sources (e.g. Molcas-generated
+    NBO files) don't: they can list extra shells for an atom after other
+    atoms' shells, fragmenting that atom's functions across more than one
+    run.
+
+    Parameters
+    ----------
+    final_basis : list of basis-function dicts (must have a 'CENTER' key).
+    cmo, overlap, fock : AO-indexed arrays sharing final_basis's AO order
+        (cmo rows, overlap/fock rows *and* columns).
+
+    Returns
+    -------
+    (final_basis, cmo, overlap, fock, inverse_perm)
+        Reordered copies of the inputs, grouped by CENTER (or the original
+        objects, untouched, when no reordering was needed -- inverse_perm
+        is None in that case). Apply inverse_perm to any AO-indexed output
+        (e.g. localized_cmo's rows) to restore the original basis-function
+        order before it's compared against, or returned alongside, the
+        original (unpermuted) final_basis/overlap/etc.
+    """
+    if analyze_center_contiguity(final_basis)["contiguous"]:
+        return final_basis, cmo, overlap, fock, None
+
+    centers = [int(bf["CENTER"]) for bf in final_basis]
+    perm = np.argsort(centers, kind="stable")
+    inverse_perm = np.argsort(perm)
+
+    reordered_basis = [final_basis[i] for i in perm]
+    reordered_cmo = cmo[perm, :]
+    reordered_overlap = overlap[np.ix_(perm, perm)]
+    reordered_fock = fock[np.ix_(perm, perm)]
+
+    return reordered_basis, reordered_cmo, reordered_overlap, reordered_fock, inverse_perm
 
 
 def get_fock_matrix(path, key_path=None, spin="alpha", cmo=None, overlap=None):
@@ -921,7 +1039,7 @@ def _localize_orbitals_with_fallback(cmo, overlap, fock, basis, space, n_occ, or
 
     _localize_orbitals_cpp being non-None only means the extension
     *imported* successfully for this Python's ABI -- it doesn't guarantee
-    a given call succeeds (native crashes/errors, unexpected input shapes,
+    a given call succeeds (natiTve crashes/errors, unexpected input shapes,
     etc. can still only surface when the compiled function actually runs).
     So this is a runtime check around the call itself, not just the
     import-time availability check localize_orbitals_cpp() already does.
@@ -1030,7 +1148,11 @@ def compute_localized_cube_data(
 
     cmo, overlap, final_basis = get_localization_inputs(path, key_path=key_path, spin=spin)
     fock = get_fock_matrix(path, key_path=key_path, spin=spin, cmo=cmo, overlap=overlap)
-    basis_center = get_center_ranges(final_basis)
+
+    ordered_basis, ordered_cmo, ordered_overlap, ordered_fock, inverse_perm = (
+        _reorder_for_contiguous_centers(final_basis, cmo, overlap, fock)
+    )
+    basis_center = get_center_ranges(ordered_basis)
 
     _, _occ_alpha_probe, _occ_beta_probe = _get_occupation_arrays(path, key_path=key_path)
     is_open_shell = _occ_beta_probe is not None
@@ -1039,9 +1161,11 @@ def compute_localized_cube_data(
         n_occ = get_num_occupied_orbitals(path, key_path=key_path, spin=spin)
 
     localized_cmo, loc_energy = _localize_orbitals_with_fallback(
-        cmo, overlap, fock, basis_center,
+        ordered_cmo, ordered_overlap, ordered_fock, basis_center,
         space, n_occ, orbital_range, seed,
     )
+    if inverse_perm is not None:
+        localized_cmo = localized_cmo[inverse_perm, :]
 
     n_sel = localized_cmo.shape[1]
     orbital_indices = list(range(1, n_sel + 1))
@@ -1159,7 +1283,10 @@ if __name__ == "__main__":
     print(f"C^T F C diagonal (first 10)   : {np.diag(fock_mo)[:10].round(6)}")
     print(f"Max |off-diagonal| of C^T F C : {np.max(np.abs(fock_off)):.3e}")
 
-    basis_center = get_center_ranges(basis)
+    ordered_basis, ordered_cmo, ordered_overlap, ordered_fock, inverse_perm = (
+        _reorder_for_contiguous_centers(basis, cmo, S, F)
+    )
+    basis_center = get_center_ranges(ordered_basis)
     n_occ = get_num_occupied_orbitals(args.path, key_path=args.key_path, spin=args.spin)
     print(f"\nOccupied orbitals for {args.spin} : {n_occ}")
 
@@ -1173,9 +1300,11 @@ if __name__ == "__main__":
 
     start = time.perf_counter()
     localized_cmo, loc_energy = primary_fn(
-        cmo, S, F, basis_center,
+        ordered_cmo, ordered_overlap, ordered_fock, basis_center,
         space=args.space, n_occ=n_occ, orbital_range=orbital_range,
     )
+    if inverse_perm is not None:
+        localized_cmo = localized_cmo[inverse_perm, :]
     primary_elapsed = time.perf_counter() - start
 
     print(f"\n{primary_label} implementation ({primary_elapsed:.4f}s):")
@@ -1201,9 +1330,11 @@ if __name__ == "__main__":
         start = time.perf_counter()
         try:
             other_cmo, other_energy = other_fn(
-                cmo, S, F, basis_center,
+                ordered_cmo, ordered_overlap, ordered_fock, basis_center,
                 space=args.space, n_occ=n_occ, orbital_range=orbital_range,
             )
+            if inverse_perm is not None:
+                other_cmo = other_cmo[inverse_perm, :]
         except Exception as exc:
             print(f"\n{other_label} implementation unavailable: {exc}")
         else:
