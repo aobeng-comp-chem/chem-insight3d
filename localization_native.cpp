@@ -1,53 +1,67 @@
-#include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <pybind11/pybind11.h>
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <iomanip>
 #include <random>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace py = pybind11;
 
 namespace {
 
+using DoubleArray = py::array_t<double, py::array::c_style | py::array::forcecast>;
+using IntArray = py::array_t<int, py::array::c_style | py::array::forcecast>;
+
 struct AtomRange {
     int bflo;
     int bfhi;
 };
 
-inline py::array_t<double> make_2d(const std::vector<double>& data, std::size_t rows, std::size_t cols) {
+inline py::array_t<double> make_2d(
+    const std::vector<double>& data,
+    std::size_t rows,
+    std::size_t cols) {
     py::array_t<double> out({rows, cols});
-    auto r = out.mutable_unchecked<2>();
-    for (std::size_t i = 0; i < rows; ++i) {
-        for (std::size_t j = 0; j < cols; ++j) {
-            r(i, j) = data[i * cols + j];
-        }
-    }
+    std::copy(data.begin(), data.end(), out.mutable_data());
     return out;
 }
 
 inline py::array_t<double> make_1d(const std::vector<double>& data) {
-    py::array_t<double> out({data.size()});
-    auto r = out.mutable_unchecked<1>();
-    for (std::size_t i = 0; i < data.size(); ++i) {
-        r(i) = data[i];
-    }
+    py::array_t<double> out({static_cast<py::ssize_t>(data.size())});
+    std::copy(data.begin(), data.end(), out.mutable_data());
     return out;
 }
 
-std::pair<int, int> select_orbital_range(int n_orbitals, const std::string& space, int n_occ, const py::tuple& orbital_range) {
+std::pair<int, int> select_orbital_range(
+    int n_orbitals,
+    const std::string& space,
+    int n_occ,
+    const py::tuple& orbital_range) {
     if (space == "occupied") {
-        if (n_occ <= 0) throw std::invalid_argument("n_occ must be positive for occupied space");
+        if (n_occ <= 0) {
+            throw std::invalid_argument("n_occ must be positive for occupied space");
+        }
         return {0, n_occ};
     }
     if (space == "virtual") {
-        if (n_occ <= 0) throw std::invalid_argument("n_occ must be positive for virtual space");
+        if (n_occ <= 0) {
+            throw std::invalid_argument("n_occ must be positive for virtual space");
+        }
         return {n_occ, n_orbitals};
     }
     if (space == "range") {
-        if (orbital_range.size() != 2) throw std::invalid_argument("orbital_range must be a 2-tuple");
-        int first = orbital_range[0].cast<int>();
-        int last = orbital_range[1].cast<int>();
+        if (orbital_range.size() != 2) {
+            throw std::invalid_argument("orbital_range must be a 2-tuple");
+        }
+        const int first = orbital_range[0].cast<int>();
+        const int last = orbital_range[1].cast<int>();
         if (!(1 <= first && first <= last && last <= n_orbitals)) {
             throw std::invalid_argument("orbital_range is out of bounds");
         }
@@ -56,217 +70,241 @@ std::pair<int, int> select_orbital_range(int n_orbitals, const std::string& spac
     throw std::invalid_argument("Unknown orbital space");
 }
 
-void validate_inputs(const py::array_t<double>& cmo_arr, const py::array_t<double>& overlap_arr, const py::array_t<double>& fock_arr) {
-    if (cmo_arr.ndim() != 2) throw std::invalid_argument("cmo must be a 2D array");
-    if (overlap_arr.ndim() != 2) throw std::invalid_argument("overlap must be a 2D array");
-    if (fock_arr.ndim() != 2) throw std::invalid_argument("fock must be a 2D array");
-
-    auto cmo = cmo_arr.unchecked<2>();
-    auto overlap = overlap_arr.unchecked<2>();
-    auto fock = fock_arr.unchecked<2>();
-
-    if (overlap.shape(0) != cmo.shape(0) || overlap.shape(1) != cmo.shape(0)) {
-        throw std::invalid_argument("overlap must be square with size equal to number of basis functions");
+void validate_inputs(
+    const DoubleArray& cmo,
+    const DoubleArray& overlap,
+    const DoubleArray& fock) {
+    if (cmo.ndim() != 2) throw std::invalid_argument("cmo must be a 2D array");
+    if (overlap.ndim() != 2) throw std::invalid_argument("overlap must be a 2D array");
+    if (fock.ndim() != 2) throw std::invalid_argument("fock must be a 2D array");
+    if (overlap.shape(0) != cmo.shape(0) ||
+        overlap.shape(1) != cmo.shape(0)) {
+        throw std::invalid_argument(
+            "overlap must be square with size equal to number of basis functions");
     }
-    if (fock.shape(0) != cmo.shape(0) || fock.shape(1) != cmo.shape(0)) {
-        throw std::invalid_argument("fock must be square with size equal to number of basis functions");
+    if (fock.shape(0) != cmo.shape(0) ||
+        fock.shape(1) != cmo.shape(0)) {
+        throw std::invalid_argument(
+            "fock must be square with size equal to number of basis functions");
     }
 }
 
-std::vector<double> reduce_by_atom(const std::vector<double>& values, const std::vector<std::vector<int>>& atom_ranges, int n_basis_fn) {
-    std::vector<double> reduced(atom_ranges.size(), 0.0);
-    for (std::size_t atom_idx = 0; atom_idx < atom_ranges.size(); ++atom_idx) {
-        double sum = 0.0;
-        for (int idx : atom_ranges[atom_idx]) {
-            sum += values[idx];
-        }
-        reduced[atom_idx] = sum;
-    }
-    return reduced;
-}
-
-// sum_A sum_i q[A,i]^2 -- the Pipek-Mezey objective, same convergence
-// criterion the Python implementation uses (localization_io.py's
-// pipek_mezey_objective). atomic_populations is natom*n_sel, flat.
-inline double pipek_mezey_objective(const std::vector<double>& atomic_populations) {
+// Population columns are contiguous for the two orbitals in a Jacobi pair.
+// Atom-major traversal preserves Python's objective accumulation order.
+inline double pipek_mezey_objective(
+    const std::vector<double>& populations,
+    int natom,
+    int n_sel) {
     double total = 0.0;
-    for (double v : atomic_populations) total += v * v;
+    for (int atom = 0; atom < natom; ++atom) {
+        for (int orbital = 0; orbital < n_sel; ++orbital) {
+            const double value =
+                populations[static_cast<std::size_t>(orbital) * natom + atom];
+            total += value * value;
+        }
+    }
     return total;
 }
 
-// np.sign() semantics: exactly 0.0 at x == 0, not +1/-1. bst == 0 means no
-// net population imbalance for this pair, so the rotation must be a no-op.
-inline double sign_of(double x) {
-    if (x > 0.0) return 1.0;
-    if (x < 0.0) return -1.0;
+inline double sign_of(double value) {
+    if (value > 0.0) return 1.0;
+    if (value < 0.0) return -1.0;
     return 0.0;
 }
 
 }  // namespace
 
 py::tuple localize_orbitals_cpp(
-    py::array_t<double> cmo_arr,
-    py::array_t<double> overlap_arr,
-    py::array_t<double> fock_arr,
+    DoubleArray cmo_arr,
+    DoubleArray overlap_arr,
+    DoubleArray fock_arr,
     py::list basis_list,
     const std::string& space = "occupied",
     int n_occ = 0,
     py::tuple orbital_range = py::tuple(),
     int seed = 0,
-    py::array_t<int> sweep_orders = py::array_t<int>()
-) {
+    IntArray sweep_orders = IntArray()) {
+    const auto start_time = std::chrono::steady_clock::now();
     validate_inputs(cmo_arr, overlap_arr, fock_arr);
 
-    auto cmo = cmo_arr.unchecked<2>();
-    auto overlap = overlap_arr.unchecked<2>();
-    auto fock = fock_arr.unchecked<2>();
+    const int n_basis_fn = static_cast<int>(cmo_arr.shape(0));
+    const int n_orbitals = static_cast<int>(cmo_arr.shape(1));
+    const double* const cmo_data = cmo_arr.data();
+    const double* const overlap_data = overlap_arr.data();
+    const double* const fock_data = fock_arr.data();
 
-    const int n_basis_fn = cmo.shape(0);
-    const int n_orbitals = cmo.shape(1);
+    if (basis_list.size() == 0) {
+        throw std::invalid_argument("basis must contain at least one atom");
+    }
 
     std::vector<AtomRange> basis;
     basis.reserve(basis_list.size());
     for (py::handle item : basis_list) {
-        py::dict atom = item.cast<py::dict>();
-        basis.push_back({atom["bflo"].cast<int>(), atom["bfhi"].cast<int>()});
+        const py::dict atom = item.cast<py::dict>();
+        const AtomRange range{
+            atom["bflo"].cast<int>(),
+            atom["bfhi"].cast<int>()};
+        if (!(0 <= range.bflo && range.bflo <= range.bfhi &&
+              range.bfhi < n_basis_fn)) {
+            throw std::invalid_argument("Invalid basis-function range");
+        }
+        basis.push_back(range);
     }
 
-    auto [lo, hi] = select_orbital_range(n_orbitals, space, n_occ, orbital_range);
+    const auto [lo, hi] =
+        select_orbital_range(n_orbitals, space, n_occ, orbital_range);
     if (!(0 <= lo && lo < hi && hi <= n_orbitals)) {
         throw std::invalid_argument("Orbital selection is out of bounds");
     }
 
     const int n_sel = hi - lo;
     const int natom = static_cast<int>(basis.size());
+    const std::size_t orbital_size = static_cast<std::size_t>(n_basis_fn);
+    const bool have_orders =
+        sweep_orders.ndim() == 2 &&
+        sweep_orders.shape(0) > 0 &&
+        sweep_orders.shape(1) == n_sel;
+    const int order_count =
+        have_orders ? static_cast<int>(sweep_orders.shape(0)) : 0;
+    const int* const order_data =
+        have_orders ? sweep_orders.data() : nullptr;
 
-    std::vector<std::vector<int>> atom_ranges;
-    atom_ranges.reserve(natom);
-    for (int atom_index = 0; atom_index < natom; ++atom_index) {
-        const auto& atom = basis[atom_index];
-        const int bflo = atom.bflo;
-        const int bfhi = atom.bfhi;
-        if (!(0 <= bflo && bflo <= bfhi && bfhi < n_basis_fn)) {
-            throw std::invalid_argument("Invalid basis-function range");
-        }
-        std::vector<int> indices;
-        indices.reserve(bfhi - bflo + 1);
-        for (int idx = bflo; idx <= bfhi; ++idx) {
-            indices.push_back(idx);
-        }
-        atom_ranges.push_back(std::move(indices));
-    }
-
-    std::vector<double> c(n_basis_fn * n_sel);
-    std::vector<double> sc(n_basis_fn * n_sel);
-    for (int i = 0; i < n_basis_fn; ++i) {
-        for (int j = 0; j < n_sel; ++j) {
-            c[i * n_sel + j] = cmo(i, lo + j);
+    // Orbital-major storage makes both columns in a Jacobi update contiguous.
+    std::vector<double> c(orbital_size * n_sel);
+    std::vector<double> sc(orbital_size * n_sel);
+    for (int orbital = 0; orbital < n_sel; ++orbital) {
+        double* const column =
+            c.data() + static_cast<std::size_t>(orbital) * orbital_size;
+        for (int mu = 0; mu < n_basis_fn; ++mu) {
+            column[mu] =
+                cmo_data[static_cast<std::size_t>(mu) * n_orbitals +
+                         lo + orbital];
         }
     }
 
-    for (int i = 0; i < n_basis_fn; ++i) {
-        for (int j = 0; j < n_sel; ++j) {
-            double accum = 0.0;
-            for (int k = 0; k < n_basis_fn; ++k) {
-                accum += overlap(i, k) * cmo(k, lo + j);
-            }
-            sc[i * n_sel + j] = accum;
-        }
-    }
-
-    std::vector<double> atomic_populations(natom * n_sel, 0.0);
-    for (int s = 0; s < n_sel; ++s) {
-        for (int atom_idx = 0; atom_idx < natom; ++atom_idx) {
+    // S*C columns are independent: thread columns and vectorize row dots.
+    const long long initial_work =
+        static_cast<long long>(n_basis_fn) * n_basis_fn * n_sel;
+#pragma omp parallel for schedule(static) if(initial_work >= 1000000)
+    for (int orbital = 0; orbital < n_sel; ++orbital) {
+        const double* const column =
+            c.data() + static_cast<std::size_t>(orbital) * orbital_size;
+        double* const sc_column =
+            sc.data() + static_cast<std::size_t>(orbital) * orbital_size;
+        for (int mu = 0; mu < n_basis_fn; ++mu) {
+            const double* const row =
+                overlap_data + static_cast<std::size_t>(mu) * n_basis_fn;
             double sum = 0.0;
-            for (int idx : atom_ranges[atom_idx]) {
-                sum += c[idx * n_sel + s] * sc[idx * n_sel + s];
+#pragma omp simd reduction(+:sum)
+            for (int nu = 0; nu < n_basis_fn; ++nu) {
+                sum += row[nu] * column[nu];
             }
-            atomic_populations[atom_idx * n_sel + s] = sum;
+            sc_column[mu] = sum;
         }
     }
 
-    const double gamma_tol = 1.0e-10;
-    const double coupling_tol = 1.0e-14;
-    // Same convergence criteria as localization_io.localize_orbitals: a
-    // combined absolute+relative tolerance on the Pipek-Mezey objective's
-    // sweep-to-sweep change, or a sweep with zero rotations. max_sweeps is
-    // a ceiling, not a target -- with real convergence checking it usually
-    // stops far earlier, same as the Python version.
-    const double objective_atol = 1.0e-12;
-    const double objective_rtol = 1.0e-10;
-    const int max_sweeps = 2000;
-
-    std::vector<std::vector<int>> sweep_orders_by_step;
-    const bool have_sweep_orders = sweep_orders.ndim() == 2 && sweep_orders.shape(0) > 0 && sweep_orders.shape(1) == n_sel;
-    if (have_sweep_orders) {
-        auto orders = sweep_orders.unchecked<2>();
-        sweep_orders_by_step.reserve(orders.shape(0));
-        for (std::size_t sweep_idx = 0; sweep_idx < static_cast<std::size_t>(orders.shape(0)); ++sweep_idx) {
-            std::vector<int> order(n_sel);
-            for (int i = 0; i < n_sel; ++i) {
-                order[i] = orders(sweep_idx, i);
+    std::vector<double> populations(
+        static_cast<std::size_t>(n_sel) * natom,
+        0.0);
+#pragma omp parallel for schedule(static) if(n_basis_fn * n_sel >= 20000)
+    for (int orbital = 0; orbital < n_sel; ++orbital) {
+        const double* const column =
+            c.data() + static_cast<std::size_t>(orbital) * orbital_size;
+        const double* const sc_column =
+            sc.data() + static_cast<std::size_t>(orbital) * orbital_size;
+        double* const q =
+            populations.data() + static_cast<std::size_t>(orbital) * natom;
+        for (int atom = 0; atom < natom; ++atom) {
+            const AtomRange range = basis[atom];
+            double sum = 0.0;
+            for (int mu = range.bflo; mu <= range.bfhi; ++mu) {
+                sum += column[mu] * sc_column[mu];
             }
-            sweep_orders_by_step.push_back(std::move(order));
+            q[atom] = sum;
         }
     }
+
+    constexpr double gamma_tol = 1.0e-10;
+    constexpr double coupling_tol = 1.0e-14;
+    constexpr double objective_atol = 1.0e-12;
+    constexpr double objective_rtol = 1.0e-10;
+    constexpr int max_sweeps = 2000;
 
     std::vector<int> order(n_sel);
-    for (int i = 0; i < n_sel; ++i) order[i] = i;
+    for (int orbital = 0; orbital < n_sel; ++orbital) {
+        order[orbital] = orbital;
+    }
+    std::vector<double> qast(natom);
 
-    std::vector<double> cross_ao(n_basis_fn);
-    std::vector<double> cross_ao_tmp(n_basis_fn);
-    std::vector<double> rotated_c_s(n_basis_fn);
-    std::vector<double> rotated_c_t(n_basis_fn);
-    std::vector<double> rotated_sc_s(n_basis_fn);
-    std::vector<double> rotated_sc_t(n_basis_fn);
+    double previous_objective =
+        pipek_mezey_objective(populations, natom, n_sel);
+    double current_objective = previous_objective;
+    long long total_rotations = 0;
+    int final_sweep = 0;
+    bool converged = false;
 
-    double prev_objective = pipek_mezey_objective(atomic_populations);
-
+    // Pairs stay sequential because each one changes the next pair's inputs.
     for (int sweep = 0; sweep < max_sweeps; ++sweep) {
-        if (have_sweep_orders && static_cast<std::size_t>(sweep) < sweep_orders_by_step.size()) {
-            order = sweep_orders_by_step[sweep];
+        final_sweep = sweep + 1;
+        if (have_orders && sweep < order_count) {
+            const int* const supplied =
+                order_data + static_cast<std::size_t>(sweep) * n_sel;
+            std::copy(supplied, supplied + n_sel, order.begin());
         } else {
             std::mt19937 rng(static_cast<unsigned>(seed + sweep));
             std::shuffle(order.begin(), order.end(), rng);
         }
-        int rotations_this_sweep = 0;
+
+        int sweep_rotations = 0;
         for (int s : order) {
+            if (!(0 <= s && s < n_sel)) {
+                throw std::invalid_argument(
+                    "sweep_orders contains an invalid orbital index");
+            }
+            double* const c_s =
+                c.data() + static_cast<std::size_t>(s) * orbital_size;
+            double* const sc_s =
+                sc.data() + static_cast<std::size_t>(s) * orbital_size;
+            double* const q_s =
+                populations.data() + static_cast<std::size_t>(s) * natom;
+
             for (int t = 0; t < n_sel; ++t) {
                 if (t == s) continue;
 
-                std::vector<double> qas(natom);
-                std::vector<double> qat(natom);
-                for (int atom_idx = 0; atom_idx < natom; ++atom_idx) {
-                    qas[atom_idx] = atomic_populations[atom_idx * n_sel + s];
-                    qat[atom_idx] = atomic_populations[atom_idx * n_sel + t];
-                }
-
-                for (int mu = 0; mu < n_basis_fn; ++mu) {
-                    cross_ao[mu] = 0.5 * (c[mu * n_sel + t] * sc[mu * n_sel + s] + c[mu * n_sel + s] * sc[mu * n_sel + t]);
-                }
-
-                std::vector<double> qast(natom);
-                for (int atom_idx = 0; atom_idx < natom; ++atom_idx) {
-                    double sum = 0.0;
-                    for (int idx : atom_ranges[atom_idx]) {
-                        sum += cross_ao[idx];
-                    }
-                    qast[atom_idx] = sum;
-                }
+                double* const c_t =
+                    c.data() + static_cast<std::size_t>(t) * orbital_size;
+                double* const sc_t =
+                    sc.data() + static_cast<std::size_t>(t) * orbital_size;
+                double* const q_t =
+                    populations.data() + static_cast<std::size_t>(t) * natom;
 
                 double ast = 0.0;
                 double bst = 0.0;
-                for (int atom_idx = 0; atom_idx < natom; ++atom_idx) {
-                    const double diff = qas[atom_idx] - qat[atom_idx];
-                    ast += qast[atom_idx] * qast[atom_idx] - 0.25 * diff * diff;
-                    bst += qast[atom_idx] * diff;
+                for (int atom = 0; atom < natom; ++atom) {
+                    const AtomRange range = basis[atom];
+                    double cross = 0.0;
+                    for (int mu = range.bflo; mu <= range.bfhi; ++mu) {
+                        cross +=
+                            0.5 *
+                            (c_t[mu] * sc_s[mu] +
+                             c_s[mu] * sc_t[mu]);
+                    }
+                    qast[atom] = cross;
+                    const double difference = q_s[atom] - q_t[atom];
+                    ast +=
+                        cross * cross -
+                        0.25 * difference * difference;
+                    bst += cross * difference;
                 }
 
                 const double denominator = std::hypot(ast, bst);
                 if (denominator < coupling_tol) continue;
 
-                const double cos_arg = std::max(-1.0, std::min(1.0, -ast / denominator));
-                const double gamma = 0.25 * std::acos(cos_arg) * sign_of(bst);
+                const double gamma =
+                    0.25 *
+                    std::acos(std::clamp(
+                        -ast / denominator, -1.0, 1.0)) *
+                    sign_of(bst);
                 if (std::abs(gamma) <= gamma_tol) continue;
 
                 const double cosg = std::cos(gamma);
@@ -275,85 +313,158 @@ py::tuple localize_orbitals_cpp(
                 const double sing2 = sing * sing;
                 const double two_cos_sin = 2.0 * cosg * sing;
 
+#pragma omp simd
                 for (int mu = 0; mu < n_basis_fn; ++mu) {
-                    rotated_c_s[mu] = cosg * c[mu * n_sel + s] + sing * c[mu * n_sel + t];
-                    rotated_c_t[mu] = cosg * c[mu * n_sel + t] - sing * c[mu * n_sel + s];
-                    rotated_sc_s[mu] = cosg * sc[mu * n_sel + s] + sing * sc[mu * n_sel + t];
-                    rotated_sc_t[mu] = cosg * sc[mu * n_sel + t] - sing * sc[mu * n_sel + s];
+                    const double old_c_s = c_s[mu];
+                    const double old_c_t = c_t[mu];
+                    const double old_sc_s = sc_s[mu];
+                    const double old_sc_t = sc_t[mu];
+                    c_s[mu] = cosg * old_c_s + sing * old_c_t;
+                    c_t[mu] = cosg * old_c_t - sing * old_c_s;
+                    sc_s[mu] = cosg * old_sc_s + sing * old_sc_t;
+                    sc_t[mu] = cosg * old_sc_t - sing * old_sc_s;
                 }
 
-                for (int mu = 0; mu < n_basis_fn; ++mu) {
-                    c[mu * n_sel + s] = rotated_c_s[mu];
-                    c[mu * n_sel + t] = rotated_c_t[mu];
-                    sc[mu * n_sel + s] = rotated_sc_s[mu];
-                    sc[mu * n_sel + t] = rotated_sc_t[mu];
+                for (int atom = 0; atom < natom; ++atom) {
+                    const double old_q_s = q_s[atom];
+                    const double old_q_t = q_t[atom];
+                    q_s[atom] =
+                        cosg2 * old_q_s +
+                        sing2 * old_q_t +
+                        two_cos_sin * qast[atom];
+                    q_t[atom] =
+                        sing2 * old_q_s +
+                        cosg2 * old_q_t -
+                        two_cos_sin * qast[atom];
                 }
-
-                for (int atom_idx = 0; atom_idx < natom; ++atom_idx) {
-                    const double q_s_new = cosg2 * qas[atom_idx] + sing2 * qat[atom_idx] + two_cos_sin * qast[atom_idx];
-                    const double q_t_new = sing2 * qas[atom_idx] + cosg2 * qat[atom_idx] - two_cos_sin * qast[atom_idx];
-                    atomic_populations[atom_idx * n_sel + s] = q_s_new;
-                    atomic_populations[atom_idx * n_sel + t] = q_t_new;
-                }
-
-                ++rotations_this_sweep;
+                ++sweep_rotations;
+                ++total_rotations;
             }
         }
 
-        // Recompute atomic_populations from c/sc once per sweep, same as
-        // the Python version: removes floating-point drift accumulated by
-        // many incremental analytic updates in a row.
-        for (int s = 0; s < n_sel; ++s) {
-            for (int atom_idx = 0; atom_idx < natom; ++atom_idx) {
+        // Independent columns can be recomputed in parallel deterministically.
+#pragma omp parallel for schedule(static) if(n_basis_fn * n_sel >= 20000)
+        for (int orbital = 0; orbital < n_sel; ++orbital) {
+            const double* const column =
+                c.data() +
+                static_cast<std::size_t>(orbital) * orbital_size;
+            const double* const sc_column =
+                sc.data() +
+                static_cast<std::size_t>(orbital) * orbital_size;
+            double* const q =
+                populations.data() +
+                static_cast<std::size_t>(orbital) * natom;
+            for (int atom = 0; atom < natom; ++atom) {
+                const AtomRange range = basis[atom];
                 double sum = 0.0;
-                for (int idx : atom_ranges[atom_idx]) {
-                    sum += c[idx * n_sel + s] * sc[idx * n_sel + s];
+                for (int mu = range.bflo; mu <= range.bfhi; ++mu) {
+                    sum += column[mu] * sc_column[mu];
                 }
-                atomic_populations[atom_idx * n_sel + s] = sum;
+                q[atom] = sum;
             }
         }
 
-        const double current_objective = pipek_mezey_objective(atomic_populations);
-        const double objective_change = current_objective - prev_objective;
-        const double convergence_threshold =
-            objective_atol + objective_rtol * std::max(std::abs(prev_objective), std::abs(current_objective));
-
-        if (std::abs(objective_change) <= convergence_threshold) break;
-        if (rotations_this_sweep == 0) break;
-
-        prev_objective = current_objective;
+        current_objective =
+            pipek_mezey_objective(populations, natom, n_sel);
+        const double change =
+            current_objective - previous_objective;
+        const double threshold =
+            objective_atol +
+            objective_rtol *
+                std::max(
+                    std::abs(previous_objective),
+                    std::abs(current_objective));
+        if (std::abs(change) <= threshold ||
+            sweep_rotations == 0) {
+            converged = true;
+            break;
+        }
+        previous_objective = current_objective;
     }
 
+    // F*C columns are independent: thread columns and vectorize row dots.
     std::vector<double> energies(n_sel, 0.0);
-    for (int i = 0; i < n_sel; ++i) {
+    const long long energy_work =
+        static_cast<long long>(n_basis_fn) * n_basis_fn * n_sel;
+#pragma omp parallel for schedule(static) if(energy_work >= 1000000)
+    for (int orbital = 0; orbital < n_sel; ++orbital) {
+        const double* const column =
+            c.data() + static_cast<std::size_t>(orbital) * orbital_size;
         double energy = 0.0;
         for (int mu = 0; mu < n_basis_fn; ++mu) {
+            const double* const row =
+                fock_data + static_cast<std::size_t>(mu) * n_basis_fn;
+            double fc_mu = 0.0;
+#pragma omp simd reduction(+:fc_mu)
             for (int nu = 0; nu < n_basis_fn; ++nu) {
-                energy += c[mu * n_sel + i] * fock(mu, nu) * c[nu * n_sel + i];
+                fc_mu += row[nu] * column[nu];
             }
+            energy += column[mu] * fc_mu;
         }
-        energies[i] = energy;
+        energies[orbital] = energy;
     }
 
-    // Sort by Fock expectation value, same as the Python version's
-    // sorted_c/loc_energy contract.
     std::vector<int> sort_idx(n_sel);
-    for (int i = 0; i < n_sel; ++i) sort_idx[i] = i;
-    std::sort(sort_idx.begin(), sort_idx.end(),
-              [&](int a, int b) { return energies[a] < energies[b]; });
-
-    std::vector<double> sorted_c(static_cast<std::size_t>(n_basis_fn) * n_sel);
-    std::vector<double> sorted_energies(n_sel);
-    for (int i = 0; i < n_basis_fn; ++i) {
-        for (int j = 0; j < n_sel; ++j) {
-            sorted_c[i * n_sel + j] = c[i * n_sel + sort_idx[j]];
-        }
+    for (int orbital = 0; orbital < n_sel; ++orbital) {
+        sort_idx[orbital] = orbital;
     }
-    for (int j = 0; j < n_sel; ++j) sorted_energies[j] = energies[sort_idx[j]];
+    std::sort(
+        sort_idx.begin(),
+        sort_idx.end(),
+        [&](int left, int right) {
+            return energies[left] < energies[right];
+        });
 
-    return py::make_tuple(make_2d(sorted_c, n_basis_fn, n_sel), make_1d(sorted_energies));
+    std::vector<double> sorted_c(orbital_size * n_sel);
+    std::vector<double> sorted_energies(n_sel);
+    for (int sorted = 0; sorted < n_sel; ++sorted) {
+        const int source = sort_idx[sorted];
+        const double* const source_column =
+            c.data() + static_cast<std::size_t>(source) * orbital_size;
+        for (int mu = 0; mu < n_basis_fn; ++mu) {
+            sorted_c[
+                static_cast<std::size_t>(mu) * n_sel + sorted] =
+                source_column[mu];
+        }
+        sorted_energies[sorted] = energies[source];
+    }
+
+    py::array_t<double> result_c =
+        make_2d(sorted_c, n_basis_fn, n_sel);
+    py::array_t<double> result_energies =
+        make_1d(sorted_energies);
+
+    const double seconds =
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start_time)
+            .count();
+    std::ostringstream message;
+    message
+        << "C++ localization runtime: "
+        << std::fixed << std::setprecision(6)
+        << seconds << " seconds ("
+        << final_sweep << " sweeps, "
+        << total_rotations << " rotations, "
+        << (converged ? "converged" : "not converged")
+        << ")";
+    py::print(message.str());
+
+    return py::make_tuple(
+        std::move(result_c),
+        std::move(result_energies));
 }
 
-PYBIND11_MODULE(localization_native, m) {
-    m.def("localize_orbitals_cpp", &localize_orbitals_cpp, py::arg("cmo"), py::arg("overlap"), py::arg("fock"), py::arg("basis"), py::arg("space") = "occupied", py::arg("n_occ") = 0, py::arg("orbital_range") = py::tuple(), py::arg("seed") = 0, py::arg("sweep_orders") = py::array_t<int>());
+PYBIND11_MODULE(localization_native, module) {
+    module.def(
+        "localize_orbitals_cpp",
+        &localize_orbitals_cpp,
+        py::arg("cmo"),
+        py::arg("overlap"),
+        py::arg("fock"),
+        py::arg("basis"),
+        py::arg("space") = "occupied",
+        py::arg("n_occ") = 0,
+        py::arg("orbital_range") = py::tuple(),
+        py::arg("seed") = 0,
+        py::arg("sweep_orders") = IntArray());
 }

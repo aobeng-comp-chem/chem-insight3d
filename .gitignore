@@ -91,4 +91,7 @@ SeH_*
 sto3g.fchk
 build_dist/
 test*/
+!tests/
+tests/*
+!tests/test_source_caching.py
 .codex

@@ -417,9 +417,25 @@ class _KeyFilePickerDialog(QDialog):
         self.list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
 
         import nbo_read as _nr
+
+        # get_orbital_count() re-parses the (possibly large) basis file just
+        # to count basis functions -- parse it once here and hand the result
+        # to every key file below, instead of once per key file (all of them
+        # share this same basis_path).
+        basis_info_dict = None
+        try:
+            basis_ext = os.path.splitext(basis_path)[1].lower()
+            if basis_ext == '.47':
+                basis_info_dict, _, _, _ = _nr.parse_file47(basis_path)
+            elif basis_ext == '.31':
+                basis_info_dict, _, _, _ = _nr.parse_file31(basis_path)
+        except Exception:
+            basis_info_dict = None  # fall back to per-file parsing below
+
         for path in key_files:
             try:
-                orb_type, nbas, is_open = _nr.get_orbital_count(path)
+                orb_type, nbas, is_open = _nr.get_orbital_count(
+                    path, basis_info_dict=basis_info_dict)
                 tag  = "  [open shell]" if is_open else ""
                 text = f"{os.path.basename(path)}    ·  {orb_type}  ·  {nbas} orbitals{tag}"
             except Exception:

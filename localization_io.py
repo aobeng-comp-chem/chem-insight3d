@@ -13,7 +13,8 @@ localization once it has them.
     get_fock_matrix(path, key_path=None, spin='alpha', cmo=None, overlap=None)
         -> fock_matrix
 
-    localize_orbitals(cmo, overlap, fock, final_basis, space='occupied'|'virtual'|'range', ...)
+    localize_orbitals(cmo, overlap, fock, final_basis,
+                       space='occupied'|'virtual'|'range'|'occupied_valence', ...)
         -> (localized_cmo, loc_energy)
 
     compute_localized_cube_data(path, spin='alpha', space='occupied', ...)
@@ -27,9 +28,6 @@ import warnings
 import numpy as np
 import pandas as pd
 from itertools import product
-
-from overlap_matrix import get_overlap_matrix as _get_smat
-from bas_dict import dict_keys
 
 try:
     from localization_native import localize_orbitals_cpp as _localize_orbitals_cpp
@@ -85,18 +83,25 @@ def get_localization_inputs(path, key_path=None, spin="alpha"):
         final_basis, _, _ = _nr.load_basis_headless(path)
         nbas = len(final_basis)
         cmo_rows = _nr.load_cmos_headless(key_path, list(range(1, nbas + 1)), spin=spin)
+        # Cached per basis file (path) -- reused across every call for this
+        # file within the process, instead of re-integrating the same
+        # (nbas, nbas) overlap matrix on every localization/population-
+        # analysis request. See nbo_read.get_ao_overlap_matrix().
+        overlap_matrix = _nr.get_ao_overlap_matrix(path)
 
     elif source_type == "fchk":
         import fchk_read as _fr
         final_basis, _, _ = _fr.load_basis_from_fchk(path)
         nbas = len(final_basis)
         cmo_rows = _fr.load_cmos_from_fchk(path, list(range(1, nbas + 1)), spin=spin)
+        overlap_matrix = _fr.get_ao_overlap_matrix(path)
 
     elif source_type == "molden":
         import read_molden as _mr
         final_basis, _, _ = _mr.load_basis_from_molden(path)
         nbas = len(final_basis)
         cmo_rows = _mr.load_cmos_from_molden(path, list(range(1, nbas + 1)), spin=spin)
+        overlap_matrix = _mr.get_ao_overlap_matrix(path)
 
     else:
         raise ValueError(f"Unrecognized source file: {path}")
@@ -104,10 +109,6 @@ def get_localization_inputs(path, key_path=None, spin="alpha"):
     # Loaders return one row per orbital (row i = MO i's AO coefficients);
     # localization code expects the standard AO x MO convention.
     cmo_matrix = np.asarray(cmo_rows, dtype=float).T
-
-    overlap_matrix = _get_smat(
-        final_basis, dict_keys, normalize_primitives=False, diagonal_only=False
-    )
 
     return cmo_matrix, overlap_matrix, final_basis
 
@@ -409,6 +410,22 @@ def get_electron_count(path, key_path=None):
     return float(np.sum(occ_alpha) * _CLOSED_SHELL_OCC_SCALE[source_type])
 
 
+def _num_occupied_from_arrays(source_type, occ_alpha, occ_beta, spin="alpha", path="source"):
+    if occ_beta is None:
+        # Closed-shell: same scale-normalization as get_electron_count.
+        n_electrons = np.sum(occ_alpha) * _CLOSED_SHELL_OCC_SCALE[source_type]
+        if round(n_electrons) % 2 != 0:
+            raise ValueError(
+                f"{path} has an odd electron count ({n_electrons:g}) for a "
+                "closed-shell source -- this looks like an open-shell "
+                "system reporting only one spin channel."
+            )
+        return int(round(n_electrons)) // 2
+
+    occ = occ_beta if spin.lower().startswith("b") else occ_alpha
+    return int(round(float(np.sum(occ))))
+
+
 def get_num_occupied_orbitals(path, key_path=None, spin="alpha"):
     """
     Number of occupied (spatial) molecular orbitals.
@@ -424,20 +441,131 @@ def get_num_occupied_orbitals(path, key_path=None, spin="alpha"):
     n_occ = n_electrons/2 wouldn't be an integer.
     """
     source_type, occ_alpha, occ_beta = _get_occupation_arrays(path, key_path=key_path)
+    return _num_occupied_from_arrays(
+        source_type, occ_alpha, occ_beta, spin=spin, path=path
+    )
 
-    if occ_beta is None:
-        # Closed-shell: same scale-normalization as get_electron_count.
-        n_electrons = np.sum(occ_alpha) * _CLOSED_SHELL_OCC_SCALE[source_type]
-        if round(n_electrons) % 2 != 0:
+
+def _prepare_atom_grouping(basis, n_basis_fn):
+    """
+    Precompute the grouped-AO-index bookkeeping needed to sum any
+    AO-indexed array over each atom's basis functions.
+
+    Returns a `reduce_by_atom(values)` callable: sums `values` (shape
+    (n_basis_fn, ...)) over each atom's ['bflo', 'bfhi'] range, giving an
+    (natom, ...) array in the same atom order as `basis`. Shared by
+    localize_orbitals() and atomic_populations() so both use identical
+    atom bookkeeping and range validation.
+    """
+    natom = len(basis)
+    atom_ranges = []
+    atom_starts = np.empty(natom, dtype=np.intp)
+
+    next_start = 0
+    for atom_index, atom in enumerate(basis):
+        bflo = int(atom["bflo"])
+        bfhi = int(atom["bfhi"])
+
+        if not (0 <= bflo <= bfhi < n_basis_fn):
             raise ValueError(
-                f"{path} has an odd electron count ({n_electrons:g}) for a "
-                "closed-shell source -- this looks like an open-shell "
-                "system reporting only one spin channel."
+                f"Invalid basis-function range ({bflo}, {bfhi}) "
+                f"for atom {atom_index}; valid basis indices are "
+                f"0 through {n_basis_fn - 1}."
             )
-        return int(round(n_electrons)) // 2
 
-    occ = occ_beta if spin.lower().startswith("b") else occ_alpha
-    return int(round(float(np.sum(occ))))
+        atom_starts[atom_index] = next_start
+        indices = np.arange(bflo, bfhi + 1, dtype=np.intp)
+        atom_ranges.append(indices)
+        next_start += indices.size
+
+    grouped_ao_indices = (
+        np.concatenate(atom_ranges) if atom_ranges else np.empty(0, dtype=np.intp)
+    )
+
+    ao_ranges_are_contiguous = (
+        grouped_ao_indices.size == n_basis_fn
+        and np.array_equal(grouped_ao_indices, np.arange(n_basis_fn))
+    )
+
+    def reduce_by_atom(values):
+        if values.shape[0] != n_basis_fn:
+            raise ValueError(
+                "The first dimension of values must equal the number "
+                "of basis functions."
+            )
+        grouped_values = (
+            values if ao_ranges_are_contiguous else values[grouped_ao_indices, ...]
+        )
+        return np.add.reduceat(grouped_values, atom_starts, axis=0)
+
+    return reduce_by_atom
+
+
+def atomic_populations(cmo, overlap, basis):
+    """
+    Per-atom Mulliken-style population q[A, i] of every orbital i (column
+    of `cmo`) on every atom A (per-atom range in `basis`).
+
+        q[A, i] = sum_{mu in A} C[mu, i] * (S C)[mu, i]
+
+    For a canonical MO that is normalized in the AO metric (c_i^T S c_i =
+    1, always true for orbitals straight out of an SCF), sum_A q[A, i] ==
+    1, so q[A, i] doubles as that orbital's population *fraction* on atom
+    A -- which is what find_valence_start() relies on.
+
+    Parameters
+    ----------
+    cmo     : (nbas, norb) ndarray, AO x MO.
+    overlap : (nbas, nbas) ndarray, AO overlap matrix S.
+    basis   : per-atom AO ranges (each with inclusive 'bflo'/'bfhi'),
+              sharing cmo/overlap's AO ordering -- see get_center_ranges().
+
+    Returns
+    -------
+    (natom, norb) ndarray.
+    """
+    cmo = np.asarray(cmo, dtype=float)
+    overlap = np.asarray(overlap, dtype=float)
+    reduce_by_atom = _prepare_atom_grouping(basis, cmo.shape[0])
+    return reduce_by_atom(cmo * (overlap @ cmo))
+
+
+def find_valence_start(cmo, overlap, basis, n_occ, core_threshold=0.98):
+    """
+    Split the occupied orbitals into an inner/core block and an outer/
+    valence block, based on how atom-centered each one is.
+
+    Core orbitals are near-perfectly localized on a single atom already
+    (typically >=98% of their population); Pipek-Mezey localization has
+    little left to do for them and mixing them in only slows/destabilizes
+    convergence for the orbitals that actually need it. So: starting from
+    the lowest-energy occupied orbital (column 0), an orbital is core as
+    long as its single largest atomic population share is >= core_threshold.
+    The first occupied orbital that drops below core_threshold marks the
+    start of the valence block; every orbital from there through the HOMO
+    is valence, regardless of that orbital's own population share.
+
+    Parameters
+    ----------
+    cmo     : (nbas, norb) ndarray, AO x MO, canonical/energy-ordered.
+    overlap : (nbas, nbas) ndarray, AO overlap matrix S.
+    basis   : per-atom AO ranges, see atomic_populations().
+    n_occ   : number of occupied orbitals (columns 0..n_occ-1 are checked).
+    core_threshold : float, default=0.98 -- minimum single-atom population
+        fraction (0-1) for an orbital to count as core.
+
+    Returns
+    -------
+    valence_start : int -- 0-based index, among the occupied orbitals, of
+        the first valence orbital. 0 if none of them meet core_threshold
+        (the whole occupied space is valence); n_occ if all of them do (no
+        valence space to localize).
+    """
+    q_occ = atomic_populations(cmo[:, :n_occ], overlap, basis)
+    max_atom_share = np.max(q_occ, axis=0)
+
+    below_threshold = np.flatnonzero(max_atom_share < core_threshold)
+    return int(below_threshold[0]) if below_threshold.size else n_occ
 
 
 def _fock_diagonal(c, fock):
@@ -454,6 +582,7 @@ def localize_orbitals(
     n_occ=None,
     orbital_range=None,
     seed=0,
+    core_threshold=0.98,
 ):
     """
     Localize a subset of molecular orbitals with Pipek-Mezey localization
@@ -487,12 +616,16 @@ def localize_orbitals(
         Per-atom basis-function ranges. Each element must contain
         inclusive 'bflo' and 'bfhi' indices.
 
-    space : {'occupied', 'virtual', 'range'}, default='occupied'
-        Orbital subspace to localize.
+    space : {'occupied', 'virtual', 'range', 'occupied_valence'}, default='occupied'
+        Orbital subspace to localize. 'occupied_valence' auto-splits the
+        occupied space into an inner/core block and an outer/valence block
+        (see find_valence_start()) and localizes -- and returns -- only the
+        valence block; the core orbitals are left completely out of this
+        call, same as any orbital outside the requested space/range.
 
     n_occ : int or None
-        Number of occupied orbitals. Required for space='occupied'
-        and space='virtual'.
+        Number of occupied orbitals. Required for space='occupied',
+        space='virtual', and space='occupied_valence'.
 
     orbital_range : tuple[int, int] or None
         First and last MO numbers using 1-based inclusive indexing.
@@ -501,10 +634,16 @@ def localize_orbitals(
     seed : int or None, default=0
         Random seed controlling the orbital-pair sweep order.
 
+    core_threshold : float, default=0.98
+        Only used for space='occupied_valence' -- see find_valence_start().
+
     Returns
     -------
     sorted_c : (nbas, n_selected) ndarray
-        Localized orbitals sorted by Fock expectation value.
+        Localized orbitals of the requested subspace, sorted by Fock
+        expectation value. For space='occupied_valence', n_selected is the
+        size of the valence block alone (0 if every occupied orbital meets
+        core_threshold -- see find_valence_start()), not n_occ.
 
     loc_energy : (n_selected,) ndarray
         Fock expectation values of the localized orbitals.
@@ -574,10 +713,34 @@ def localize_orbitals(
 
         lo, hi = first - 1, last
 
+    elif space == "occupied_valence":
+        if n_occ is None:
+            raise ValueError(
+                "n_occ is required when space='occupied_valence'."
+            )
+
+        valence_start = find_valence_start(
+            cmo, overlap, basis, n_occ, core_threshold=core_threshold
+        )
+
+        if valence_start >= n_occ:
+            # Every occupied orbital already meets core_threshold -- there
+            # is no valence block to localize. The core orbitals are left
+            # untouched and are NOT part of this call's output (same as
+            # they wouldn't be for any other space selection).
+            print(
+                f"All {n_occ} occupied orbitals meet the core threshold "
+                f"({core_threshold:.0%} single-atom population) -- "
+                "no valence orbitals to localize."
+            )
+            return cmo[:, :0].copy(), np.empty(0, dtype=float)
+
+        lo, hi = valence_start, n_occ
+
     else:
         raise ValueError(
             f"Unknown orbital space: {space!r}; expected "
-            "'occupied', 'virtual', or 'range'."
+            "'occupied', 'virtual', 'range', or 'occupied_valence'."
         )
 
     if not (0 <= lo < hi <= n_orbitals):
@@ -600,73 +763,9 @@ def localize_orbitals(
 
     max_sweeps = 2000
 
-    # ---------------------------------------------------------------
-    # Prepare a grouped list of AO indices.
-    #
-    # atom_starts contains the starting position of each atom in the
-    # grouped AO list. np.add.reduceat can therefore replace the loops
-    # over atoms and basis functions.
-    # ---------------------------------------------------------------
-    atom_ranges = []
-    atom_starts = np.empty(natom, dtype=np.intp)
-
-    next_start = 0
-
-    for atom_index, atom in enumerate(basis):
-        bflo = int(atom["bflo"])
-        bfhi = int(atom["bfhi"])
-
-        if not (0 <= bflo <= bfhi < n_basis_fn):
-            raise ValueError(
-                f"Invalid basis-function range ({bflo}, {bfhi}) "
-                f"for atom {atom_index}; valid basis indices are "
-                f"0 through {n_basis_fn - 1}."
-            )
-
-        atom_starts[atom_index] = next_start
-
-        indices = np.arange(
-            bflo,
-            bfhi + 1,
-            dtype=np.intp,
-        )
-
-        atom_ranges.append(indices)
-        next_start += indices.size
-
-    grouped_ao_indices = np.concatenate(atom_ranges)
-
-    # When the ranges already correspond to every AO in its normal order,
-    # array indexing can be skipped entirely.
-    ao_ranges_are_contiguous = (
-        grouped_ao_indices.size == n_basis_fn
-        and np.array_equal(
-            grouped_ao_indices,
-            np.arange(n_basis_fn),
-        )
-    )
-
-    def reduce_by_atom(values):
-        """
-        Sum a one- or two-dimensional AO array over the basis functions
-        belonging to each atom.
-        """
-        if values.shape[0] != n_basis_fn:
-            raise ValueError(
-                "The first dimension of values must equal the number "
-                "of basis functions."
-            )
-
-        if ao_ranges_are_contiguous:
-            grouped_values = values
-        else:
-            grouped_values = values[grouped_ao_indices, ...]
-
-        return np.add.reduceat(
-            grouped_values,
-            atom_starts,
-            axis=0,
-        )
+    # reduce_by_atom(values) sums an AO-indexed array over each atom's
+    # basis functions via np.add.reduceat -- see _prepare_atom_grouping().
+    reduce_by_atom = _prepare_atom_grouping(basis, n_basis_fn)
 
     def calculate_atomic_populations(coefficients, overlap_coefficients):
         """
@@ -980,11 +1079,19 @@ def localize_orbitals_cpp(
     n_occ=None,
     orbital_range=None,
     seed=0,
+    core_threshold=0.98,
 ):
     """Thin wrapper around the native localization implementation.
 
     This is intended for benchmarking the speed of a C++ implementation
     against the pure-Python/NumPy version in :func:`localize_orbitals`.
+
+    space='occupied_valence' is resolved in Python via find_valence_start()
+    -- same as localize_orbitals() -- since the native extension itself
+    only understands 'occupied'/'virtual'/'range'; it's handed the
+    resolved valence block as an equivalent 'range' call, and only that
+    block is returned (the core orbitals are left out of this call
+    entirely, same as localize_orbitals()).
     """
     if _localize_orbitals_cpp is None:
         raise ImportError(
@@ -995,23 +1102,47 @@ def localize_orbitals_cpp(
     if n_occ is None:
         n_occ = 0
 
-    if orbital_range is None:
-        orbital_range = ()
-    else:
-        orbital_range = tuple(orbital_range)
-
     cmo_arr = np.asarray(cmo, dtype=float)
+    overlap_arr = np.asarray(overlap, dtype=float)
+    fock_arr = np.asarray(fock, dtype=float)
     n_orbitals = cmo_arr.shape[1]
 
-    if space == "occupied":
+    native_space = space
+    native_orbital_range = orbital_range
+
+    if space == "occupied_valence":
+        valence_start = find_valence_start(
+            cmo_arr, overlap_arr, basis, n_occ, core_threshold=core_threshold
+        )
+
+        if valence_start >= n_occ:
+            print(
+                f"All {n_occ} occupied orbitals meet the core threshold "
+                f"({core_threshold:.0%} single-atom population) -- "
+                "no valence orbitals to localize."
+            )
+            return cmo_arr[:, :0].copy(), np.empty(0, dtype=float)
+
+        native_space = "range"
+        native_orbital_range = (valence_start + 1, n_occ)
+
+    if native_orbital_range is None:
+        native_orbital_range = ()
+    else:
+        native_orbital_range = tuple(native_orbital_range)
+
+    if native_space == "occupied":
         lo, hi = 0, n_occ
-    elif space == "virtual":
+    elif native_space == "virtual":
         lo, hi = n_occ, n_orbitals
-    elif space == "range":
-        first, last = orbital_range
+    elif native_space == "range":
+        first, last = native_orbital_range
         lo, hi = first - 1, last
     else:
-        raise ValueError(f"Unknown orbital space: {space!r}; expected 'occupied', 'virtual', or 'range'.")
+        raise ValueError(
+            f"Unknown orbital space: {space!r}; expected 'occupied', "
+            "'virtual', 'range', or 'occupied_valence'."
+        )
 
     n_sel = hi - lo
     rng = np.random.default_rng(seed)
@@ -1021,18 +1152,20 @@ def localize_orbitals_cpp(
 
     return _localize_orbitals_cpp(
         cmo_arr,
-        np.asarray(overlap, dtype=float),
-        np.asarray(fock, dtype=float),
+        overlap_arr,
+        fock_arr,
         basis,
-        space=space,
+        space=native_space,
         n_occ=n_occ,
-        orbital_range=orbital_range,
+        orbital_range=native_orbital_range,
         seed=seed,
         sweep_orders=sweep_orders,
     )
 
 
-def _localize_orbitals_with_fallback(cmo, overlap, fock, basis, space, n_occ, orbital_range, seed):
+def _localize_orbitals_with_fallback(
+    cmo, overlap, fock, basis, space, n_occ, orbital_range, seed, core_threshold=0.98,
+):
     """
     Prefer the native (C++) localization implementation; fall back to the
     pure-Python localize_orbitals if it's unavailable or fails.
@@ -1049,6 +1182,7 @@ def _localize_orbitals_with_fallback(cmo, overlap, fock, basis, space, n_occ, or
             return localize_orbitals_cpp(
                 cmo, overlap, fock, basis,
                 space=space, n_occ=n_occ, orbital_range=orbital_range, seed=seed,
+                core_threshold=core_threshold,
             )
         except Exception as exc:
             warnings.warn(
@@ -1061,6 +1195,7 @@ def _localize_orbitals_with_fallback(cmo, overlap, fock, basis, space, n_occ, or
     return localize_orbitals(
         cmo, overlap, fock, basis,
         space=space, n_occ=n_occ, orbital_range=orbital_range, seed=seed,
+        core_threshold=core_threshold,
     )
 
 
@@ -1071,6 +1206,7 @@ def compute_localized_cube_data(
     n_occ=None,
     orbital_range=None,
     seed=0,
+    core_threshold=0.98,
     grid_quality=75,
     ext_dist=4.0,
     bohr_const=0.529177249,
@@ -1096,8 +1232,11 @@ def compute_localized_cube_data(
 
     Parameters
     ----------
-    path, spin, space, n_occ, orbital_range, seed : see localize_orbitals /
-        get_localization_inputs.
+    path, spin, space, n_occ, orbital_range, seed, core_threshold : see
+        localize_orbitals / get_localization_inputs. space='occupied_valence'
+        auto-splits the occupied space (per core_threshold) and produces
+        cubes for the outer/valence orbitals only -- inner/core orbitals
+        are left untouched and are not part of the returned cubes at all.
     grid_quality, ext_dist, bohr_const : see compute_cube_data /
         compute_cube_data_fchk / compute_cube_data_molden.
 
@@ -1154,15 +1293,17 @@ def compute_localized_cube_data(
     )
     basis_center = get_center_ranges(ordered_basis)
 
-    _, _occ_alpha_probe, _occ_beta_probe = _get_occupation_arrays(path, key_path=key_path)
-    is_open_shell = _occ_beta_probe is not None
+    occ_source_type, occ_alpha, occ_beta = _get_occupation_arrays(path, key_path=key_path)
+    is_open_shell = occ_beta is not None
 
-    if space in ("occupied", "virtual") and n_occ is None:
-        n_occ = get_num_occupied_orbitals(path, key_path=key_path, spin=spin)
+    if space in ("occupied", "virtual", "occupied_valence") and n_occ is None:
+        n_occ = _num_occupied_from_arrays(
+            occ_source_type, occ_alpha, occ_beta, spin=spin, path=path
+        )
 
     localized_cmo, loc_energy = _localize_orbitals_with_fallback(
         ordered_cmo, ordered_overlap, ordered_fock, basis_center,
-        space, n_occ, orbital_range, seed,
+        space, n_occ, orbital_range, seed, core_threshold=core_threshold,
     )
     if inverse_perm is not None:
         localized_cmo = localized_cmo[inverse_perm, :]
@@ -1171,7 +1312,7 @@ def compute_localized_cube_data(
     orbital_indices = list(range(1, n_sel + 1))
     cmos_rows = list(localized_cmo.T)
 
-    if space == "occupied":
+    if space in ("occupied", "occupied_valence"):
         # Closed-shell orbitals hold 2 electrons each; open-shell spin-
         # orbitals (each spin solved independently) hold exactly 1.
         occupations = np.full(n_sel, 1.0 if is_open_shell else 2.0)
@@ -1193,11 +1334,13 @@ def compute_localized_cube_data(
         cubes = _fr.compute_cube_data_fchk(
             path, orbital_indices, spin, grid_quality, ext_dist, bohr_const,
             precomputed_cmos=cmos_rows,
+            precomputed_basis=(final_basis, coordinates_ang, atom_info),
         )
     else:
         cubes = _mr.compute_cube_data_molden(
             path, orbital_indices, spin, grid_quality, ext_dist, bohr_const,
             precomputed_cmos=cmos_rows,
+            precomputed_basis=(final_basis, coordinates_ang, atom_info),
         )
 
     base = os.path.splitext(os.path.basename(path))[0]
@@ -1235,13 +1378,22 @@ if __name__ == "__main__":
     )
     parser.add_argument("--spin", default="alpha", choices=["alpha", "beta"])
     parser.add_argument(
-        "--space", default="occupied", choices=["occupied", "virtual", "range"],
-        help="Orbital subspace to localize (default: occupied).",
+        "--space", default="occupied",
+        choices=["occupied", "virtual", "range", "occupied_valence"],
+        help="Orbital subspace to localize (default: occupied). 'occupied_valence' "
+             "auto-splits the occupied space into core/valence via --core-threshold "
+             "and localizes only the valence block.",
     )
     parser.add_argument(
         "--range", dest="orbital_range", default=None,
         help="Inclusive 1-based 'first-last' MO numbers, required when --space=range "
              "(e.g. '49-60').",
+    )
+    parser.add_argument(
+        "--core-threshold", dest="core_threshold", type=float, default=0.98,
+        help="Minimum single-atom population fraction (0-1) for an occupied orbital "
+             "to be classified core; only used when --space=occupied_valence "
+             "(default: 0.98).",
     )
     parser.add_argument(
         "--use-native", action="store_true",
@@ -1302,6 +1454,7 @@ if __name__ == "__main__":
     localized_cmo, loc_energy = primary_fn(
         ordered_cmo, ordered_overlap, ordered_fock, basis_center,
         space=args.space, n_occ=n_occ, orbital_range=orbital_range,
+        core_threshold=args.core_threshold,
     )
     if inverse_perm is not None:
         localized_cmo = localized_cmo[inverse_perm, :]
@@ -1332,6 +1485,7 @@ if __name__ == "__main__":
             other_cmo, other_energy = other_fn(
                 ordered_cmo, ordered_overlap, ordered_fock, basis_center,
                 space=args.space, n_occ=n_occ, orbital_range=orbital_range,
+                core_threshold=args.core_threshold,
             )
             if inverse_perm is not None:
                 other_cmo = other_cmo[inverse_perm, :]

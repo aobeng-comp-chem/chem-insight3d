@@ -38,6 +38,16 @@ import math
 import copy
 import numpy as np
 from scipy.constants import physical_constants
+from source_cache import ComputationCache, file_cache_key
+
+
+_SOURCE_CACHE = ComputationCache()
+
+
+def clear_source_cache():
+    """Clear all parsed and derived Molden data (primarily useful in tests)."""
+    _SOURCE_CACHE.clear()
+
 
 _BOHR_TO_ANG = physical_constants['Bohr radius'][0] * 1e10  # 0.529177…
 
@@ -489,10 +499,10 @@ def _normalise_basis(raw_basis):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Internal full-parse helper (cached per call site)
+# Internal full-parse helper (cached per file identity)
 # ────────────────────────────────────────────────────────────────────────────
 
-def _parse_molden(molden_path):
+def _parse_molden_uncached(molden_path):
     """
     Parse all sections of a molden file and return a dict with keys:
         atom_symbols, atomic_nums, coordinates_ang, atom_info,
@@ -530,6 +540,13 @@ def _parse_molden(molden_path):
     }
 
 
+def _parse_molden(molden_path):
+    cache_key = ("parsed", file_cache_key(molden_path))
+    return _SOURCE_CACHE.get(
+        cache_key, lambda: _parse_molden_uncached(molden_path)
+    )
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Public API
 # ────────────────────────────────────────────────────────────────────────────
@@ -544,11 +561,31 @@ def load_basis_from_molden(molden_path):
     coordinates_ang  : list of (x, y, z) in Angstrom, one per atom
     atom_info        : list of (Z, x, y, z) in Angstrom, one per atom
     """
-    data = _parse_molden(molden_path)
-    final_norm_basis = _normalise_basis(data['raw_basis'])
-    # print(final_norm_basis)
-    # print(len(final_norm_basis))
-    return final_norm_basis, data['coordinates_ang'], data['atom_info']
+    cache_key = ("basis", file_cache_key(molden_path))
+
+    def load():
+        data = _parse_molden(molden_path)
+        final_norm_basis = _normalise_basis(data['raw_basis'])
+        return final_norm_basis, data['coordinates_ang'], data['atom_info']
+
+    return _SOURCE_CACHE.get(cache_key, load)
+
+
+def get_ao_overlap_matrix(molden_path):
+    """Return the final normalized-basis overlap, computed once per file."""
+    cache_key = ("ao_overlap", file_cache_key(molden_path))
+
+    def load():
+        from overlap_matrix import get_overlap_matrix
+        from bas_dict import dict_keys
+
+        final_basis, _, _ = load_basis_from_molden(molden_path)
+        return get_overlap_matrix(
+            final_basis, dict_keys,
+            normalize_primitives=False, diagonal_only=False,
+        )
+
+    return _SOURCE_CACHE.get(cache_key, load)
 
 
 def get_orbital_count_molden(molden_path):
@@ -607,7 +644,7 @@ def load_cmos_from_molden(molden_path, orbital_indices, spin='alpha'):
 
 def compute_cube_data_molden(molden_path, orbital_indices, spin,
                               grid_quality, ext_dist, bohr_const,
-                              precomputed_cmos=None):
+                              precomputed_cmos=None, precomputed_basis=None):
     """
     Compute orbital grids directly from a .molden file.
 
@@ -629,8 +666,11 @@ def compute_cube_data_molden(molden_path, orbital_indices, spin,
     except ImportError:
         _use_cpp = False
 
-    final_norm_basis, coordinates_ang, atom_info = \
-        load_basis_from_molden(molden_path)
+    if precomputed_basis is None:
+        final_norm_basis, coordinates_ang, atom_info = \
+            load_basis_from_molden(molden_path)
+    else:
+        final_norm_basis, coordinates_ang, atom_info = precomputed_basis
     cmos = precomputed_cmos if precomputed_cmos is not None else load_cmos_from_molden(molden_path, orbital_indices, spin)
 
     coord_bohr = np.array(coordinates_ang) / bohr_const

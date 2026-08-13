@@ -33,6 +33,25 @@ import math
 import copy
 import numpy as np
 from scipy.constants import physical_constants
+from source_cache import ComputationCache, file_cache_key
+
+
+_SOURCE_CACHE = ComputationCache()
+
+
+def clear_source_cache():
+    """Clear all parsed and derived fchk data (primarily useful in tests)."""
+    _SOURCE_CACHE.clear()
+
+
+def _read_fchk_lines(fchk_path):
+    cache_key = ("lines", file_cache_key(fchk_path))
+
+    def load():
+        with open(fchk_path, "r") as handle:
+            return handle.read().splitlines()
+
+    return _SOURCE_CACHE.get(cache_key, load)
 
 # ---------------------------------------------------------------------------
 # Low-level fchk parser
@@ -340,18 +359,36 @@ def load_basis_from_fchk(fchk_path):
     coordinates_ang  : list of (x, y, z) in Angstrom, one per atom
     atom_info        : list of (Z, x, y, z) in Angstrom, one per atom
     """
-    with open(fchk_path, "r") as f:
-        lines = f.read().splitlines()
+    cache_key = ("basis", file_cache_key(fchk_path))
 
-    raw_basis       = _extract_basis_set(lines)
-    coordinates_ang, atom_info = _extract_atoms(lines)
-    
-    final_norm_basis = _normalise_basis(raw_basis)
+    def load():
+        lines = _read_fchk_lines(fchk_path)
+        raw_basis = _extract_basis_set(lines)
+        coordinates_ang, atom_info = _extract_atoms(lines)
+        final_norm_basis = _normalise_basis(raw_basis)
+        return final_norm_basis, coordinates_ang, atom_info
 
-    return   final_norm_basis, coordinates_ang, atom_info
+    return _SOURCE_CACHE.get(cache_key, load)
 
 
-def get_orbital_count_fchk(fchk_path):
+def get_ao_overlap_matrix(fchk_path):
+    """Return the final normalized-basis overlap, computed once per file."""
+    cache_key = ("ao_overlap", file_cache_key(fchk_path))
+
+    def load():
+        from overlap_matrix import get_overlap_matrix
+        from bas_dict import dict_keys
+
+        final_basis, _, _ = load_basis_from_fchk(fchk_path)
+        return get_overlap_matrix(
+            final_basis, dict_keys,
+            normalize_primitives=False, diagonal_only=False,
+        )
+
+    return _SOURCE_CACHE.get(cache_key, load)
+
+
+def _get_orbital_count_fchk_uncached(fchk_path):
     """
     Return (orbital_type_str, nbas, is_open_shell) for a .fchk file.
 
@@ -359,8 +396,7 @@ def get_orbital_count_fchk(fchk_path):
     nbas is the number of basis functions.
     is_open_shell is True when Beta MO coefficients are present.
     """
-    with open(fchk_path, "r") as f:
-        lines = f.read().splitlines()
+    lines = _read_fchk_lines(fchk_path)
 
     nbas_val = _parse_scalar(lines, "Number of basis functions", int)
     if nbas_val is None:
@@ -373,6 +409,14 @@ def get_orbital_count_fchk(fchk_path):
         line.startswith("Beta MO coefficients") for line in lines
     )
     return "CMO", int(nbas_val), has_beta
+
+def get_orbital_count_fchk(fchk_path):
+    """Return cached fchk orbital count and open-shell metadata."""
+    cache_key = ("orbital_count", file_cache_key(fchk_path))
+    return _SOURCE_CACHE.get(
+        cache_key, lambda: _get_orbital_count_fchk_uncached(fchk_path)
+    )
+
 
 
 def _get_density_matrices(lines, nbas):
@@ -402,13 +446,12 @@ def _get_density_matrices(lines, nbas):
     return density_alpha, density_beta
 
 
-def get_orbital_energies_and_occupations_fchk(fchk_path):
+def _get_orbital_energies_and_occupations_fchk_uncached(fchk_path):
     """
     Return (ene_alpha, occ_alpha, ene_beta, occ_beta) from a .fchk file.
     All energies are in Hartree.  Beta arrays are None for closed-shell.
     """
-    with open(fchk_path, "r") as f:
-        lines = f.read().splitlines()
+    lines = _read_fchk_lines(fchk_path)
 
     ene_alpha = _parse_array(lines, "Alpha Orbital Energies", float)
     occ_alpha = _parse_array(lines, "Alpha Orbital occupancies", float)
@@ -429,15 +472,11 @@ def get_orbital_energies_and_occupations_fchk(fchk_path):
         # (n_i = C_i^T S D S C_i) instead of assuming aufbau filling.
         smat = None
         if (need_alpha and density_alpha is not None) or (need_beta and density_beta is not None):
-            final_norm_basis, _, _ = load_basis_from_fchk(fchk_path)
-            from overlap_matrix import get_overlap_matrix as getSmat
-            from bas_dict import dict_keys
-            smat = getSmat(final_norm_basis, dict_keys, normalize_primitives=False, diagonal_only=False)
+            smat = get_ao_overlap_matrix(fchk_path)
 
         if need_alpha:
             if density_alpha is not None:
-                coeff_flat = _parse_array(lines, "Alpha MO coefficients", float)
-                C = coeff_flat[:nbas * nbas].reshape(nbas, nbas).T
+                C = _load_cmo_matrix_fchk(fchk_path, "alpha").T
                 occ_alpha = calculate_occupation_numbers(C, smat, density_alpha)
             else:
                 n_elec_alpha = _parse_scalar(lines, "Number of alpha electrons", int)
@@ -447,8 +486,7 @@ def get_orbital_energies_and_occupations_fchk(fchk_path):
 
         if need_beta:
             if density_beta is not None:
-                coeff_flat = _parse_array(lines, "Beta MO coefficients", float)
-                C = coeff_flat[:nbas * nbas].reshape(nbas, nbas).T
+                C = _load_cmo_matrix_fchk(fchk_path, "beta").T
                 occ_beta = calculate_occupation_numbers(C, smat, density_beta)
             else:
                 n_elec_beta = _parse_scalar(lines, "Number of beta electrons", int)
@@ -461,6 +499,15 @@ def get_orbital_energies_and_occupations_fchk(fchk_path):
         occ_alpha if occ_alpha is not None else np.array([]),
         ene_beta,
         occ_beta,
+    )
+
+
+def get_orbital_energies_and_occupations_fchk(fchk_path):
+    """Cached form of the fchk orbital metadata extraction."""
+    cache_key = ("orbital_metadata", file_cache_key(fchk_path))
+    return _SOURCE_CACHE.get(
+        cache_key,
+        lambda: _get_orbital_energies_and_occupations_fchk_uncached(fchk_path),
     )
 
 
@@ -496,36 +543,40 @@ def load_cmos_from_fchk(fchk_path, orbital_indices, spin="alpha"):
     -------
     List of 1-D numpy arrays, one per requested orbital.
     """
-    with open(fchk_path, "r") as f:
-        lines = f.read().splitlines()
-
-    _, nbas, is_open = get_orbital_count_fchk(fchk_path)
-
-    if spin.lower().startswith("b") and is_open:
-        section = "Beta MO coefficients"
-    else:
-        section = "Alpha MO coefficients"
-
-    mo_flat = _parse_array(lines, section, float)
-    if mo_flat is None:
-        raise ValueError(
-            f"Section '{section}' not found in {fchk_path}"
-        )
-
-    expected = nbas * nbas
-    if mo_flat.size < expected:
-        raise ValueError(
-            f"Expected {expected} MO coefficients, got {mo_flat.size}"
-        )
-
-    # fchk stores MOs row-by-row: row i = orbital i coefficients
-    mo_matrix = mo_flat[:expected].reshape(nbas, nbas)
+    # fchk stores MOs row-by-row: row i = orbital i coefficients.
+    mo_matrix = _load_cmo_matrix_fchk(fchk_path, spin)
     return [mo_matrix[i - 1] for i in orbital_indices]
+
+
+def _load_cmo_matrix_fchk(fchk_path, spin="alpha"):
+    spin_key = "beta" if spin.lower().startswith("b") else "alpha"
+    cache_key = ("cmo_matrix", spin_key, file_cache_key(fchk_path))
+
+    def load():
+        lines = _read_fchk_lines(fchk_path)
+        _, nbas, is_open = get_orbital_count_fchk(fchk_path)
+        section = (
+            "Beta MO coefficients"
+            if spin_key == "beta" and is_open
+            else "Alpha MO coefficients"
+        )
+        mo_flat = _parse_array(lines, section, float)
+        if mo_flat is None:
+            raise ValueError(f"Section '{section}' not found in {fchk_path}")
+
+        expected = nbas * nbas
+        if mo_flat.size < expected:
+            raise ValueError(
+                f"Expected {expected} MO coefficients, got {mo_flat.size}"
+            )
+        return mo_flat[:expected].reshape(nbas, nbas)
+
+    return _SOURCE_CACHE.get(cache_key, load)
 
 
 def compute_cube_data_fchk(fchk_path, orbital_indices, spin,
                             grid_quality, ext_dist, bohr_const,
-                            precomputed_cmos=None):
+                            precomputed_cmos=None, precomputed_basis=None):
     """
     Compute orbital grids directly from a .fchk file.
 
@@ -550,7 +601,10 @@ def compute_cube_data_fchk(fchk_path, orbital_indices, spin,
     except ImportError:
         _use_cpp = False
 
-    final_norm_basis, coordinates_ang, atom_info = load_basis_from_fchk(fchk_path)
+    if precomputed_basis is None:
+        final_norm_basis, coordinates_ang, atom_info = load_basis_from_fchk(fchk_path)
+    else:
+        final_norm_basis, coordinates_ang, atom_info = precomputed_basis
     if precomputed_cmos is not None:
         cmos = precomputed_cmos
     else:

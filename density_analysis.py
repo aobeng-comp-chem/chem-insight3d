@@ -5,9 +5,9 @@ import numpy as np
 from angular_funct import ang_res_lamda
 from localization_io import (
     _get_occupation_arrays,
+    _num_occupied_from_arrays,
     _recognize_source_type,
     get_localization_inputs,
-    get_num_occupied_orbitals,
 )
 
 
@@ -338,27 +338,35 @@ def compute_spin_density_cube_data(
     else:
         raise ValueError(f"Unrecognized source file: {path}")
 
-    _, _, occ_beta_probe = _get_occupation_arrays(path, key_path=key_path)
-    is_open_shell = occ_beta_probe is not None
+    occ_source_type, occ_alpha, occ_beta = _get_occupation_arrays(path, key_path=key_path)
+    is_open_shell = occ_beta is not None
 
-    n_occ_alpha = get_num_occupied_orbitals(path, key_path=key_path, spin="alpha")
+    n_occ_alpha = _num_occupied_from_arrays(
+        occ_source_type, occ_alpha, occ_beta, spin="alpha", path=path
+    )
     n_occ_beta = (
-        get_num_occupied_orbitals(path, key_path=key_path, spin="beta")
+        _num_occupied_from_arrays(
+            occ_source_type, occ_alpha, occ_beta, spin="beta", path=path
+        )
         if is_open_shell else 0
     )
 
     alpha_cmo, _, _ = get_localization_inputs(path, key_path=key_path, spin="alpha")
-    beta_cmo, _, _ = get_localization_inputs(path, key_path=key_path, spin="beta")
 
     if n_occ_alpha > 0:
         p_alpha = alpha_cmo[:, :n_occ_alpha] @ alpha_cmo[:, :n_occ_alpha].T
     else:
         p_alpha = np.zeros((alpha_cmo.shape[0], alpha_cmo.shape[0]), dtype=float)
 
-    if is_open_shell and n_occ_beta > 0:
-        p_beta = beta_cmo[:, :n_occ_beta] @ beta_cmo[:, :n_occ_beta].T
+    if is_open_shell:
+        beta_cmo, _, _ = get_localization_inputs(path, key_path=key_path, spin="beta")
+        if n_occ_beta > 0:
+            p_beta = beta_cmo[:, :n_occ_beta] @ beta_cmo[:, :n_occ_beta].T
+        else:
+            p_beta = np.zeros_like(p_alpha)
     else:
-        p_beta = np.zeros_like(p_alpha)
+        # Closed-shell alpha and beta densities are identical.
+        p_beta = p_alpha
 
     denmat = p_alpha - p_beta
 

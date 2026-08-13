@@ -610,6 +610,32 @@ def _load_overlap_for_details(details, basis_size):
                     overlap = np.asarray(overlap, dtype=float)
                     if overlap.shape == (basis_size, basis_size):
                         return overlap
+                # $OVERLAP section missing/wrong-shaped in this .47 -- fall
+                # back to the analytically-integrated overlap, cached per
+                # file so this doesn't redo the integration on every
+                # population-analysis request (nbo_read.get_ao_overlap_matrix
+                # is the same cache localization uses for this file).
+                overlap = _nr.get_ao_overlap_matrix(candidate)
+                if overlap.shape == (basis_size, basis_size):
+                    return overlap
+        except Exception:
+            pass
+
+    source_path = details.get("source_path")
+    if source_path and os.path.exists(source_path):
+        try:
+            if source_type == "fchk":
+                import fchk_read as _fr
+                overlap = _fr.get_ao_overlap_matrix(source_path)
+            elif source_type == "molden":
+                import read_molden as _mr
+                overlap = _mr.get_ao_overlap_matrix(source_path)
+            else:
+                overlap = None
+            if overlap is not None:
+                overlap = np.asarray(overlap, dtype=float)
+                if overlap.shape == (basis_size, basis_size):
+                    return overlap
         except Exception:
             pass
 
@@ -686,8 +712,6 @@ def _compute_population_analysis_from_details(details, basis="AO"):
 
     overlap = _load_overlap_for_details(details, nbas)
     cmat = np.column_stack(cmos)
-    print(np.diag(cmat.T @ overlap @ cmat))
-    print(np.diag(overlap))
 
 
     # Transform to selected NBO-key basis if requested.  AO remains the default
@@ -715,10 +739,6 @@ def _compute_population_analysis_from_details(details, basis="AO"):
         except Exception as e:
             print(f"Failed to transform to selected NBO basis: {e}")
             # Fall back to AO
-    print("Final orbital normalization check (should be close to 1.0):")
-    print(np.diag(cmat.T @ overlap @ cmat))
-
-    print(np.diag(overlap))
     return _population_analysis_data(
         cmat,
         overlap,
@@ -796,14 +816,15 @@ class _ComputeThread(QThread):
                 f"Computing {len(self.orbital_indices)} orbital(s) "
                 f"using {engine}…")
 
-            results = _nr.compute_cube_data(
-                basis, coords, atom_info,
-                self.orbital_indices, self.key_path, self.spin,
-                self.grid_quality, self.ext_dist, bohr_const
-            )
             selected_indices = list(self.orbital_indices)
             selected_cmos = _nr.load_cmos_headless(
                 self.key_path, selected_indices, self.spin)
+            results = _nr.compute_cube_data(
+                basis, coords, atom_info,
+                selected_indices, self.key_path, self.spin,
+                self.grid_quality, self.ext_dist, bohr_const,
+                precomputed_cmos=selected_cmos,
+            )
             try:
                 ene_a, occ_a, ene_b, occ_b = \
                     _nr.get_orbital_energies_and_occupations(
@@ -973,11 +994,12 @@ class _LocalizeOptionsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Pipek-Mezey localization — choose the orbital subspace:"))
 
-        self.occ_radio   = QRadioButton("Occupied orbitals")
-        self.virt_radio  = QRadioButton("Virtual (unoccupied) orbitals")
-        self.range_radio = QRadioButton("Explicit range (1-based, inclusive)")
+        self.occ_radio     = QRadioButton("Occupied orbitals")
+        self.valence_radio = QRadioButton("Outer occupied (valence) orbitals only — auto core/valence split")
+        self.virt_radio    = QRadioButton("Virtual (unoccupied) orbitals")
+        self.range_radio   = QRadioButton("Explicit range (1-based, inclusive)")
         self.occ_radio.setChecked(True)
-        for rb in (self.occ_radio, self.virt_radio, self.range_radio):
+        for rb in (self.occ_radio, self.valence_radio, self.virt_radio, self.range_radio):
             layout.addWidget(rb)
 
         range_row = QHBoxLayout()
@@ -999,7 +1021,7 @@ class _LocalizeOptionsDialog(QDialog):
             self.first_spin.setEnabled(enabled)
             self.last_spin.setEnabled(enabled)
 
-        for rb in (self.occ_radio, self.virt_radio, self.range_radio):
+        for rb in (self.occ_radio, self.valence_radio, self.virt_radio, self.range_radio):
             rb.toggled.connect(_sync_range_enabled)
         _sync_range_enabled()
 
@@ -1017,6 +1039,8 @@ class _LocalizeOptionsDialog(QDialog):
         """Return (space, orbital_range) ready for localize_orbitals()."""
         if self.occ_radio.isChecked():
             return "occupied", None
+        if self.valence_radio.isChecked():
+            return "occupied_valence", None
         if self.virt_radio.isChecked():
             return "virtual", None
         return "range", (self.first_spin.value(), self.last_spin.value())
@@ -1669,9 +1693,25 @@ class _KeyFilePickerDialog(QDialog):
         self.list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
 
         import nbo_read as _nr
+
+        # get_orbital_count() re-parses the (possibly large) basis file just
+        # to count basis functions -- parse it once here and hand the result
+        # to every key file below, instead of once per key file (all of them
+        # share this same basis_path).
+        basis_info_dict = None
+        try:
+            basis_ext = os.path.splitext(basis_path)[1].lower()
+            if basis_ext == '.47':
+                basis_info_dict, _, _, _ = _nr.parse_file47(basis_path)
+            elif basis_ext == '.31':
+                basis_info_dict, _, _, _ = _nr.parse_file31(basis_path)
+        except Exception:
+            basis_info_dict = None  # fall back to per-file parsing below
+
         for path in key_files:
             try:
-                orb_type, nbas, is_open = _nr.get_orbital_count(path)
+                orb_type, nbas, is_open = _nr.get_orbital_count(
+                    path, basis_info_dict=basis_info_dict)
                 tag  = "  [open shell]" if is_open else ""
                 text = f"{os.path.basename(path)}    ·  {orb_type}  ·  {nbas} orbitals{tag}"
             except Exception:
@@ -1751,12 +1791,19 @@ class _FchkComputeThread(QThread):
                 f"using {engine}…")
 
             basis, coords, atom_info = _fr.load_basis_from_fchk(self.fchk_path)
-            results = _fr.compute_cube_data_fchk(
-                self.fchk_path, self.orbital_indices, self.spin,
-                self.grid_quality, self.ext_dist, bohr_const)
             selected_indices = list(self.orbital_indices)
+            _, nbas, _ = _fr.get_orbital_count_fchk(self.fchk_path)
+            if selected_indices == list(range(1, nbas + 1)):
+                selected_indices = _fr._sort_indices_by_energy(
+                    self.fchk_path, spin=self.spin, ascending=True)
             selected_cmos = _fr.load_cmos_from_fchk(
                 self.fchk_path, selected_indices, self.spin)
+            results = _fr.compute_cube_data_fchk(
+                self.fchk_path, selected_indices, self.spin,
+                self.grid_quality, self.ext_dist, bohr_const,
+                precomputed_cmos=selected_cmos,
+                precomputed_basis=(basis, coords, atom_info),
+            )
             try:
                 ene_a, occ_a, ene_b, occ_b = \
                     _fr.get_orbital_energies_and_occupations_fchk(self.fchk_path)
@@ -2221,12 +2268,15 @@ class _MoldenComputeThread(QThread):
                 f"using {engine}…")
 
             basis, coords, atom_info = _mr.load_basis_from_molden(self.molden_path)
-            results = _mr.compute_cube_data_molden(
-                self.molden_path, self.orbital_indices, self.spin,
-                self.grid_quality, self.ext_dist, bohr_const)
             selected_indices = list(self.orbital_indices)
             selected_cmos = _mr.load_cmos_from_molden(
                 self.molden_path, selected_indices, self.spin)
+            results = _mr.compute_cube_data_molden(
+                self.molden_path, selected_indices, self.spin,
+                self.grid_quality, self.ext_dist, bohr_const,
+                precomputed_cmos=selected_cmos,
+                precomputed_basis=(basis, coords, atom_info),
+            )
             try:
                 ene_a, occ_a, ene_b, occ_b = \
                     _mr.get_orbital_energies_and_occupations_molden(self.molden_path)
@@ -4768,12 +4818,32 @@ class MultiCubeVisualizer:
                     ".31", ".47", ".cube", ".log", ".out", ".txt",
                     ".py", ".json", ".png", ".pdf", ".svg",
                 }
+
+                # get_orbital_count() re-parses the basis file just to count
+                # basis functions -- parse it once here and hand the result
+                # to every key file below, instead of once per key file (all
+                # of them share this same basis file). Same fix as
+                # _KeyFilePickerDialog.
+                basis_info_dict = None
+                try:
+                    for basis_candidate in (stem + ".47", stem + ".31"):
+                        if os.path.exists(basis_candidate):
+                            basis_ext = os.path.splitext(basis_candidate)[1].lower()
+                            if basis_ext == ".47":
+                                basis_info_dict, _, _, _ = _nr.parse_file47(basis_candidate)
+                            else:
+                                basis_info_dict, _, _, _ = _nr.parse_file31(basis_candidate)
+                            break
+                except Exception:
+                    basis_info_dict = None  # fall back to per-file parsing below
+
                 for key_file in candidates:
                     ext = os.path.splitext(key_file)[1].lower()
                     if ext in skip_exts:
                         continue
                     try:
-                        orb_type, nbas, is_open = _nr.get_orbital_count(key_file)
+                        orb_type, nbas, is_open = _nr.get_orbital_count(
+                            key_file, basis_info_dict=basis_info_dict)
                         tag = " open shell" if is_open else ""
                         label = (
                             f"{orb_type} ({os.path.basename(key_file)}, "

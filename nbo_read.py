@@ -28,9 +28,44 @@ import sys
 import overlap_matrix
 from bas_dict import dict_keys
 from bas_dict import get_term_info
+from source_cache import ComputationCache
 
 getSmat = overlap_matrix.get_overlap_matrix
 bohr    = physical_constants['Bohr radius'][0] * 1e10  # Angstrom per bohr
+
+
+# ── Per-file caching ─────────────────────────────────────────────────────────
+# Parsing/normalizing a .47 (and building its overlap matrix) is expensive
+# and was being redone from scratch on every call -- once per key file shown
+# in a picker, once for the orbital load, again for localization, again for
+# population analysis, etc, all for the exact same on-disk file within one
+# session. These caches make each expensive step (raw parse, normalization
+# incl. the iterative self-overlap correction, $OVERLAP/$DENSITY/$FOCK
+# extraction, and the analytic AO overlap matrix) happen at most once per
+# file per process. Nothing downstream mutates the returned basis dicts or
+# matrices in place (normalization always copies before modifying), so
+# sharing the cached objects across callers is safe.
+_parse_file47_cache      = {}
+_parse_file31_cache      = {}
+_process_47_file_cache   = {}
+_load_basis_headless_cache = {}
+_ao_overlap_cache        = {}
+_key_source_cache = ComputationCache()
+
+
+def clear_source_cache():
+    """Clear NBO basis, matrix, key-file, and orbital metadata caches."""
+    _parse_file47_cache.clear()
+    _parse_file31_cache.clear()
+    _process_47_file_cache.clear()
+    _load_basis_headless_cache.clear()
+    _ao_overlap_cache.clear()
+    _key_source_cache.clear()
+
+
+def _file_cache_key(path):
+    st = os.stat(path)
+    return (os.path.abspath(path), st.st_mtime_ns, st.st_size)
 
 
 def double_factorial(n):
@@ -47,6 +82,11 @@ def gaussian_norm(alpha, l, m, n):
 
 
 def parse_file47(filename):
+    cache_key = _file_cache_key(filename)
+    cached = _parse_file47_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     print(f"Parsing {filename} as a .47 file")
 
     def read_file47(filename):
@@ -61,7 +101,7 @@ def parse_file47(filename):
     file_content = read_file47(filename)
 
     def parse_array_from_block(varname, content, dtype=float):
-        pattern = re.compile(rf'{varname}\s+=\s+((?:[-+]?\d+\.\d+(?:E[+-]?\d+)?\s+)+)')
+        pattern = re.compile(rf'(?<![A-Z]){varname}(?![A-Z])\s*=\s*((?:[-+]?\d+\.\d+(?:E[+-]?\d+)?\s+)+)')
         matches = pattern.findall(content)
         values = []
         for match in matches:
@@ -71,7 +111,7 @@ def parse_file47(filename):
         return values
 
     def parse_int_array(varname, content):
-        pattern = re.compile(rf'{varname}\s+=\s+([\d\s]+)')
+        pattern = re.compile(rf'(?<![A-Z]){varname}(?![A-Z])\s*=\s*([\d\s]+)')
         matches = pattern.findall(content)
         values = []
         for match in matches:
@@ -214,10 +254,17 @@ def parse_file47(filename):
     basis_info_dict, atom_data, to_bohr = system_info(file_content)
     coordinates = [atom[2:] for atom in atom_data]
     atom_info   = [(atom[0],) + tuple(atom[2:]) for atom in atom_data]
-    return basis_info_dict, coordinates, atom_info, to_bohr
+    result = (basis_info_dict, coordinates, atom_info, to_bohr)
+    _parse_file47_cache[cache_key] = result
+    return result
 
 
 def parse_file31(filename):
+    cache_key = _file_cache_key(filename)
+    cached = _parse_file31_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     print(f"Parsing {filename} as a .31 file")
     with open(filename, 'r') as file:
         to_bohr  = physical_constants['Bohr radius'][0] * 1e10
@@ -323,7 +370,9 @@ def parse_file31(filename):
         atom_info   = coordinates[:, 0].tolist()
         coordinates = coordinates[:, 1:].tolist()
         atom_info   = list(zip(atom_info, *zip(*coordinates)))
-        return basis_info_dict, coordinates, atom_info, to_bohr
+        result = (basis_info_dict, coordinates, atom_info, to_bohr)
+        _parse_file31_cache[cache_key] = result
+        return result
 
 def load_aonao_matrix(filename):
     # Placeholder: Load the AO to NAO transformation matrix from .31 or related file
@@ -394,6 +443,11 @@ def create_symmetric_matrix_vectorized(lower_triangular, n):
     return matrix + matrix.T - np.diag(matrix.diagonal())
 
 def process_47_file(file_path, nbas):
+    cache_key = (_file_cache_key(file_path), nbas)
+    cached = _process_47_file_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     with open(file_path, 'r') as file:
         content = file.read()
     lines         = content.split('\n')
@@ -425,7 +479,9 @@ def process_47_file(file_path, nbas):
                 keyword_dict[f"{keyword[1:]}_BETA"]  = zero.copy()
             else:
                 keyword_dict[keyword[1:]] = zero.copy()
-    return is_open_shell, keyword_dict
+    result = (is_open_shell, keyword_dict)
+    _process_47_file_cache[cache_key] = result
+    return result
 
 def calculate_overlap_matrix(primit_info_dict, nbo_overlap_mat):
     S         = getSmat(primit_info_dict, dict_keys, normalize_primitives=False, diagonal_only=False)
@@ -637,6 +693,11 @@ def load_basis_headless(basis_filepath):
     coordinates_ang : list of (x,y,z) tuples in Angstrom
     atom_info       : list of (Z, x_ang, y_ang, z_ang) tuples
     """
+    cache_key = _file_cache_key(basis_filepath)
+    cached = _load_basis_headless_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     ext = os.path.splitext(basis_filepath)[1].lower()
     if ext == '.47':
         basis_info_dict, coordinates, atom_info, to_bohr = parse_file47(basis_filepath)
@@ -671,7 +732,39 @@ def load_basis_headless(basis_filepath):
 
 
     # print(final_norm_basis)
-    return final_norm_basis, coordinates, atom_info
+    result = (final_norm_basis, coordinates, atom_info)
+    _load_basis_headless_cache[cache_key] = result
+    return result
+
+
+def get_ao_overlap_matrix(basis_filepath):
+    """
+    Analytic AO overlap matrix S for basis_filepath's normalized basis
+    (load_basis_headless()'s final_norm_basis), computed once per file and
+    cached -- this is the same (nbas, nbas) integral evaluation that both
+    localization (localization_io.get_localization_inputs) and population
+    analysis (chemview._load_overlap_for_details) need, so callers should
+    go through here instead of recomputing it themselves.
+    """
+    cache_key = _file_cache_key(basis_filepath)
+    cached = _ao_overlap_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    final_basis, _, _ = load_basis_headless(basis_filepath)
+    overlap = getSmat(final_basis, dict_keys, normalize_primitives=False, diagonal_only=False)
+    _ao_overlap_cache[cache_key] = overlap
+    return overlap
+
+
+def _read_key_lines(key_filepath):
+    cache_key = ("key_lines", _file_cache_key(key_filepath))
+
+    def load():
+        with open(key_filepath, "r") as handle:
+            return handle.readlines()
+
+    return _key_source_cache.get(cache_key, load)
 
 
 def _detect_open_shell_key(lines, key_filepath):
@@ -695,61 +788,85 @@ def _detect_open_shell_key(lines, key_filepath):
         return False
 
 
-def _single_block_open_shell_key(lines, key_filepath):
+def _single_block_open_shell_key(lines, key_filepath, is_open=None):
     """True for open-shell .32/.33 files that omit explicit ALPHA/BETA headers."""
     ext = os.path.splitext(key_filepath)[1].lower()
     if ext not in {'.32', '.33'}:
         return False
-    if not _detect_open_shell_key(lines, key_filepath):
+    if is_open is None:
+        is_open = _detect_open_shell_key(lines, key_filepath)
+    if not is_open:
         return False
     has_explicit_spins = any('ALPHA' in line.upper() for line in lines[:8]) or \
         any('BETA' in line.upper() for line in lines)
     return not has_explicit_spins
 
 
-def get_orbital_count(key_filepath):
+def _get_orbital_count_uncached(key_filepath, basis_info_dict=None):
     """
     Peek at key file header to determine (orbital_type_str, nbas, is_open_shell).
     orbital_type_str is e.g. 'NBO', 'NHO', 'NAO' from line 2.
     nbas is the number of basis functions (= number of orbitals in the file).
+
+    basis_info_dict : optional, the already-parsed basis (parse_file47/
+        parse_file31's first return value) for this key file's sibling
+        basis file. Callers that check many key files sharing the same
+        basis file (e.g. a "pick a key file" listing) should parse the
+        basis file once and pass it in here for every key file, instead
+        of re-parsing it -- potentially a large, expensive file -- once
+        per key file.
     """
-    with open(key_filepath, 'r') as f:
-        lines = f.readlines()
+    lines = _read_key_lines(key_filepath)
     if len(lines) < 4:
         raise ValueError("Key file too short to parse header")
     orbital_type = lines[1].strip().split()[0] if len(lines) > 1 else 'UNKNOWN'
     is_open      = _detect_open_shell_key(lines, key_filepath)
-    single_block_open = _single_block_open_shell_key(lines, key_filepath)
-    start = 3 if (not is_open or single_block_open) else 4
-    words = []
-    for line in lines[start:]:
-        if 'BETA' in line.upper():
-            break
-        for elem in line.split():
-            try:    words.append(float(elem))
-            except ValueError: pass
 
-    base, _ = os.path.splitext(key_filepath)    
-    path_47 = base + ".47"
-    path_31 = base + ".31"
-    
-    if os.path.exists(path_47):
-        basis_filepath = path_47
-    elif os.path.exists(path_31):
-        basis_filepath = path_31
-     
-        
-    ext = os.path.splitext(basis_filepath)[1].lower()
-    if ext == '.47':
-        basis_info_dict, coordinates, atom_info, to_bohr = parse_file47(basis_filepath)
-    elif ext == '.31':
-        basis_info_dict, coordinates, atom_info, to_bohr = parse_file31(basis_filepath)
-    else:
-        raise ValueError(f"Unsupported basis file extension: {ext}")
-    
+    if basis_info_dict is None:
+        base, _ = os.path.splitext(key_filepath)
+        path_47 = base + ".47"
+        path_31 = base + ".31"
+
+        if os.path.exists(path_47):
+            basis_filepath = path_47
+        elif os.path.exists(path_31):
+            basis_filepath = path_31
+        else:
+            raise FileNotFoundError(
+                f"No sibling .47 or .31 basis file found for {key_filepath}"
+            )
+
+        ext = os.path.splitext(basis_filepath)[1].lower()
+        if ext == '.47':
+            basis_info_dict, coordinates, atom_info, to_bohr = parse_file47(basis_filepath)
+        elif ext == '.31':
+            basis_info_dict, coordinates, atom_info, to_bohr = parse_file31(basis_filepath)
+        else:
+            raise ValueError(f"Unsupported basis file extension: {ext}")
+
     nbas = len(basis_info_dict)
-        
     return orbital_type, nbas, is_open
+
+
+
+def get_orbital_count(key_filepath, basis_info_dict=None):
+    """Cached public wrapper for NBO key-file orbital metadata."""
+    if basis_info_dict is not None:
+        return _get_orbital_count_uncached(key_filepath, basis_info_dict)
+
+    base = os.path.splitext(key_filepath)[0]
+    basis_filepath = None
+    for candidate in (base + ".47", base + ".31"):
+        if os.path.exists(candidate):
+            basis_filepath = candidate
+            break
+    basis_key = (
+        _file_cache_key(basis_filepath) if basis_filepath is not None else None
+    )
+    cache_key = ("orbital_count", _file_cache_key(key_filepath), basis_key)
+    return _key_source_cache.get(
+        cache_key, lambda: _get_orbital_count_uncached(key_filepath)
+    )
 
 
 def load_cmos_headless(key_filepath, orbital_indices, spin='alpha'):
@@ -758,38 +875,49 @@ def load_cmos_headless(key_filepath, orbital_indices, spin='alpha'):
     spin : 'alpha' or 'beta' (open-shell files only).
     Returns list of 1-D numpy arrays, one per requested orbital.
     """
-    
-    _, nbas, _ = get_orbital_count(key_filepath)
-
-    with open(key_filepath, 'r') as f:
-        lines = f.readlines()
-    is_open = _detect_open_shell_key(lines, key_filepath)
-    duplicate_single_block = _single_block_open_shell_key(lines, key_filepath)
-
-    if is_open and spin.lower().startswith('b') and not duplicate_single_block:
-        start_line = None
-        for i, line in enumerate(lines):
-            if 'BETA' in line.upper():
-                start_line = i + 1; break
-        if start_line is None:
-            raise ValueError("BETA section not found in open-shell key file")
-    else:
-        start_line = 3 if (not is_open or duplicate_single_block) else 4
-
-    words = []
-    for line in lines[start_line:]:
-        for elem in line.split():
-            try:
-                if len(words) < nbas * nbas:
-                    words.append(float(elem))
-            except ValueError:
-                pass
-
-
-    if len(words) < nbas * nbas:
-        raise ValueError(f"Not enough data: expected {nbas*nbas} floats, got {len(words)}")
-    orbital_arr = np.array(words[:nbas * nbas]).reshape(nbas, nbas)
+    orbital_arr = _load_cmo_matrix(key_filepath, spin)
     return [orbital_arr[i - 1] for i in orbital_indices]
+
+
+def _load_cmo_matrix(key_filepath, spin='alpha'):
+    spin_key = 'beta' if spin.lower().startswith('b') else 'alpha'
+    cache_key = ("cmo_matrix", spin_key, _file_cache_key(key_filepath))
+
+    def load():
+        _, nbas, _ = get_orbital_count(key_filepath)
+        lines = _read_key_lines(key_filepath)
+        is_open = _detect_open_shell_key(lines, key_filepath)
+        duplicate_single_block = _single_block_open_shell_key(
+            lines, key_filepath, is_open=is_open
+        )
+
+        if is_open and spin_key == 'beta' and not duplicate_single_block:
+            start_line = None
+            for i, line in enumerate(lines):
+                if 'BETA' in line.upper():
+                    start_line = i + 1
+                    break
+            if start_line is None:
+                raise ValueError("BETA section not found in open-shell key file")
+        else:
+            start_line = 3 if (not is_open or duplicate_single_block) else 4
+
+        words = []
+        for line in lines[start_line:]:
+            for elem in line.split():
+                try:
+                    if len(words) < nbas * nbas:
+                        words.append(float(elem))
+                except ValueError:
+                    pass
+
+        if len(words) < nbas * nbas:
+            raise ValueError(
+                f"Not enough data: expected {nbas*nbas} floats, got {len(words)}"
+            )
+        return np.array(words[:nbas * nbas]).reshape(nbas, nbas)
+
+    return _key_source_cache.get(cache_key, load)
 
 
 def load_transformation_matrix(key_filepath, spin='alpha'):
@@ -855,7 +983,7 @@ def load_transformation_matrix(key_filepath, spin='alpha'):
 
 #     return is_open_shell, keyword_dict
 
-def get_orbital_energies_and_occupations(key_filepath: str, basis_filepath: str = None):
+def _get_orbital_energies_and_occupations_uncached(key_filepath: str, basis_filepath: str = None):
     """
     Return orbital energies (Hartree) and occupations for the requested key file.
     Works for both closed-shell and open-shell.
@@ -920,6 +1048,27 @@ def get_orbital_energies_and_occupations(key_filepath: str, basis_filepath: str 
         occ_beta = ene_beta = None
 
     return ene_alpha, occ_alpha, ene_beta, occ_beta
+
+
+def get_orbital_energies_and_occupations(key_filepath: str, basis_filepath: str = None):
+    """Return cached NBO orbital energies and occupations."""
+    base = os.path.splitext(key_filepath)[0]
+    file47 = base + ".47"
+    file47_key = (
+        _file_cache_key(file47)
+        if os.path.exists(file47)
+        else (os.path.abspath(file47), "missing")
+    )
+    basis_key = (
+        _file_cache_key(basis_filepath)
+        if basis_filepath and os.path.exists(basis_filepath)
+        else None
+    )
+    cache_key = ("orbital_metadata", _file_cache_key(key_filepath), file47_key, basis_key)
+    return _key_source_cache.get(
+        cache_key,
+        lambda: _get_orbital_energies_and_occupations_uncached(key_filepath, basis_filepath),
+    )
 
 
 # Keep your original helper functions (improved a bit)
