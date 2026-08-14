@@ -803,6 +803,7 @@ def _single_block_open_shell_key(lines, key_filepath, is_open=None):
 
 
 # Standard NBO extension-to-orbital-type mapping (no file I/O needed)
+# Only includes extensions .32 to .41 (standard NBO output files)
 _NBO_EXTENSION_TYPES = {
     '.32': 'PNAOs',    # Pre-orthogonal Natural Atomic Orbitals
     '.33': 'NAOs',     # Natural Atomic Orbitals
@@ -814,8 +815,6 @@ _NBO_EXTENSION_TYPES = {
     '.39': 'NLMOs',    # Natural Localized Molecular Orbitals
     '.40': 'MOs',      # Molecular Orbitals
     '.41': 'NOs',      # Natural Orbitals
-    '.42': 'AO',       # Atomic Orbitals
-    '.46': 'C',        # Semicanonical Orbitals
 }
 
 
@@ -823,6 +822,7 @@ def get_orbital_type_from_extension(key_filepath):
     """
     Fast lookup: return orbital type from file extension without reading the file.
     Returns the orbital type string (e.g. 'NBOs', 'NAOs') or None if extension unknown.
+    For unknown extensions, the caller should list the file without an orbital type.
     """
     ext = os.path.splitext(key_filepath)[1].lower()
     return _NBO_EXTENSION_TYPES.get(ext)

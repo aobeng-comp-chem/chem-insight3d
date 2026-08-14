@@ -481,19 +481,16 @@ class _KeyFilePickerDialog(QDialog):
         import nbo_read as _nr
 
         # Fast extension-based lookup: get orbital types without reading files.
-        # Only read the basis file once if needed to count orbitals.
         for path in key_files:
             # Fast path: get orbital type from file extension (no I/O)
             orb_type = _nr.get_orbital_type_from_extension(path)
-            if orb_type is None:
-                # Fallback for unknown extension: try reading the file
-                try:
-                    orb_type, _, _ = _nr.get_orbital_count(path)
-                except Exception:
-                    orb_type = "Unknown"
             
-            # Show filename and orbital type only (no orbital count)
-            text = f"{os.path.basename(path)}    ·  {orb_type}"
+            # Show filename and orbital type only if known, otherwise just filename
+            if orb_type is not None:
+                text = f"{os.path.basename(path)}    ·  {orb_type}"
+            else:
+                text = os.path.basename(path)
+            
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, path)
             self.list_widget.addItem(item)
