@@ -1757,28 +1757,20 @@ class _KeyFilePickerDialog(QDialog):
 
         import nbo_read as _nr
 
-        # get_orbital_count() re-parses the (possibly large) basis file just
-        # to count basis functions -- parse it once here and hand the result
-        # to every key file below, instead of once per key file (all of them
-        # share this same basis_path).
-        basis_info_dict = None
-        try:
-            basis_ext = os.path.splitext(basis_path)[1].lower()
-            if basis_ext == '.47':
-                basis_info_dict, _, _, _ = _nr.parse_file47(basis_path)
-            elif basis_ext == '.31':
-                basis_info_dict, _, _, _ = _nr.parse_file31(basis_path)
-        except Exception:
-            basis_info_dict = None  # fall back to per-file parsing below
-
+        # Fast extension-based lookup: get orbital types without reading files.
+        # Only read the basis file once if needed to count orbitals.
         for path in key_files:
-            try:
-                orb_type, nbas, is_open = _nr.get_orbital_count(
-                    path, basis_info_dict=basis_info_dict)
-                tag  = "  [open shell]" if is_open else ""
-                text = f"{os.path.basename(path)}    ·  {orb_type}  ·  {nbas} orbitals{tag}"
-            except Exception:
-                text = os.path.basename(path)
+            # Fast path: get orbital type from file extension (no I/O)
+            orb_type = _nr.get_orbital_type_from_extension(path)
+            if orb_type is None:
+                # Fallback for unknown extension: try reading the file
+                try:
+                    orb_type, _, _ = _nr.get_orbital_count(path)
+                except Exception:
+                    orb_type = "Unknown"
+            
+            # Show filename and orbital type only (no orbital count)
+            text = f"{os.path.basename(path)}    ·  {orb_type}"
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, path)
             self.list_widget.addItem(item)

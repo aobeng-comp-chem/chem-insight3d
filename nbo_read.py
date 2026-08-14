@@ -802,6 +802,32 @@ def _single_block_open_shell_key(lines, key_filepath, is_open=None):
     return not has_explicit_spins
 
 
+# Standard NBO extension-to-orbital-type mapping (no file I/O needed)
+_NBO_EXTENSION_TYPES = {
+    '.32': 'PNAOs',    # Pre-orthogonal Natural Atomic Orbitals
+    '.33': 'NAOs',     # Natural Atomic Orbitals
+    '.34': 'PNHOs',    # Pre-orthogonal Natural Hybrid Orbitals
+    '.35': 'NHOs',     # Natural Hybrid Orbitals
+    '.36': 'PNBOs',    # Pre-orthogonal Natural Bond Orbitals
+    '.37': 'NBOs',     # Natural Bond Orbitals
+    '.38': 'PNLMOs',   # Pre-orthogonal Natural Localized Molecular Orbitals
+    '.39': 'NLMOs',    # Natural Localized Molecular Orbitals
+    '.40': 'MOs',      # Molecular Orbitals
+    '.41': 'NOs',      # Natural Orbitals
+    '.42': 'AO',       # Atomic Orbitals
+    '.46': 'C',        # Semicanonical Orbitals
+}
+
+
+def get_orbital_type_from_extension(key_filepath):
+    """
+    Fast lookup: return orbital type from file extension without reading the file.
+    Returns the orbital type string (e.g. 'NBOs', 'NAOs') or None if extension unknown.
+    """
+    ext = os.path.splitext(key_filepath)[1].lower()
+    return _NBO_EXTENSION_TYPES.get(ext)
+
+
 def _get_orbital_count_uncached(key_filepath, basis_info_dict=None):
     """
     Peek at key file header to determine (orbital_type_str, nbas, is_open_shell).
